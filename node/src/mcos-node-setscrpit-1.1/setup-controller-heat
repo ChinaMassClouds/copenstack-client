@@ -1,0 +1,133 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install heat service"
+rpm -q openstack-heat-api &> /dev/null || yum install openstack-heat-api openstack-heat-api-cfn openstack-heat-engine python-heatclient -y
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration heat service     //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the heat service"
+/usr/local/bin/controller-node-clear/clear-controller-heat
+
+echo "Create the heat database"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE heat;
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'localhost' IDENTIFIED BY '$HEAT_DB_PASS';
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'%' IDENTIFIED BY '$HEAT_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE heat;
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'localhost' IDENTIFIED BY '$HEAT_DB_PASS';
+GRANT ALL PRIVILEGES ON heat.* TO 'heat'@'%' IDENTIFIED BY '$HEAT_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat database failed"; exit 1;fi
+
+echo "Create keystone entries for heat"
+keystone user-list | grep heat &> /dev/null && keystone user-delete heat
+for ID in `keystone service-list | grep heat | awk '{print $2}'`;do keystone service-delete $ID; done
+for ID in `keystone service-list | grep heat-cfn | awk '{print $2}'`;do keystone service-delete $ID; done
+keystone role-list | grep heat_stack_owner &> /dev/null && keystone role-delete heat_stack_owner
+keystone role-list | grep heat_stack_user &> /dev/null && keystone role-delete heat_stack_user
+
+keystone user-create --name heat --pass $HEAT_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat user failed"; exit 1;fi
+
+keystone user-role-add --user heat --tenant service --role admin
+keystone role-create --name heat_stack_owner
+keystone user-role-add --user demo --tenant demo --role heat_stack_owner
+keystone role-create --name heat_stack_user  
+keystone service-create --name heat --type orchestration --description "Orchestration"
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat service failed"; exit 1;fi
+
+keystone service-create --name heat-cfn --type cloudformation \
+  --description "Orchestration"
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat-cfn service failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ orchestration / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8004/v1/%\(tenant_id\)s \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8004/v1/%\(tenant_id\)s \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8004/v1/%\(tenant_id\)s \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat endpoint orchestration failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ cloudformation / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8000/v1 \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8000/v1 \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8000/v1 \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:create heat endpoint cloudformation failed"; exit 1;fi
+
+echo "Edit the heat config file"
+sed -i "/\[database\]/a \
+connection = mysql://heat:$HEAT_DB_PASS@$MARIADB_NODE_IP/heat" /etc/heat/heat.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = heat.openstack.common.rpc.impl_kombu\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+heat_metadata_server_url = http://$CONTROLLER_NODE_HOSTNAME:8000\n\
+heat_waitcondition_server_url = http://$CONTROLLER_NODE_HOSTNAME:8000/v1/waitcondition\n\
+notification_driver = heat.openstack.common.notifier.rpc_notifier" /etc/heat/heat.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = heat\n\
+admin_password = $HEAT_USER_PASS" /etc/heat/heat.conf
+
+su -s /bin/sh -c "heat-manage db_sync" heat
+
+systemctl enable openstack-heat-api.service openstack-heat-api-cfn.service openstack-heat-engine.service
+
+systemctl start openstack-heat-api.service 
+systemctl status openstack-heat-api.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:start openstack-heat-api service failed"; exit 1;fi
+
+systemctl start openstack-heat-api-cfn.service
+systemctl status openstack-heat-api-cfn.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:start openstack-heat-api-cfn service failed"; exit 1;fi
+
+systemctl start openstack-heat-engine.service
+systemctl status openstack-heat-engine.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:heat:failed:start openstack-heat-engine service failed"; exit 1;fi
+
+send-service-report "$HostName:heat:success"
+
+

@@ -1,0 +1,65 @@
+#!/usr/bin/sh
+source /etc/openstack.cfg
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP      //////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration  mysql   // //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+#关闭防火墙
+echo "stop and disable firewalld"
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+echo "disable selinux"
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+setenforce 0
+
+sed -i '/password=123456/d' /etc/my.cnf.d/client.cnf
+
+#安装数据库服务
+echo "install the database server rpm"
+rpm -q mariadb &> /dev/null || yum -y install mariadb 
+rpm -q mariadb-server &> /dev/null || yum -y install mariadb-server 
+rpm -q MySQL-python &> /dev/null || yum -y install MySQL-python
+
+#设置数据库配置文件
+echo "set the config file /etc/my.cnf"
+sed -i.bak "10i\\
+ bind-address = 0.0.0.0\n\
+ default-storage-engine = innodb\n\
+ innodb_file_per_table\n\
+ collation-server = utf8_general_ci\n\
+ init-connect = 'SET NAMES utf8'\n\
+ character-set-server = utf8\n\
+ " /etc/my.cnf
+
+#设置数据库开机自启并启动
+echo "enable the mariadb service"
+systemctl enable mariadb.service
+systemctl start mariadb.service
+systemctl status mariadb.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:mysql:failed:start mariadb service failed"; exit 1;fi
+
+#开启数据库远程访问功能
+mysql -u root << EOF
+GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'IDENTIFIED BY '123456' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+if [ $? -gt 0 ]; then send-service-report "$HostName:mysql:failed:set remote access function failed"; exit 1;fi
+
+send-service-report "$HostName:mysql:success"
+

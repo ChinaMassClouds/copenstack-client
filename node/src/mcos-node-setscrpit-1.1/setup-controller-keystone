@@ -1,0 +1,178 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install openstack-keystone python-keystoneclient"
+rpm -q openstack-keystone &> /dev/null || yum install openstack-keystone python-keystoneclient -y  
+rpm -q hgplatformAPI &> /dev/null || yum install hgplatformAPI -y  
+
+echo "yum install yum-plugin-priorities"
+rpm -q yum-plugin-priorities &> /dev/null || yum install yum-plugin-priorities -y 
+
+echo "yum install openstack-selinux"
+rpm -q openstack-selinux &> /dev/null || yum install openstack-selinux -y  
+
+echo "yum install ntp"
+rpm -q ntp &> /dev/null || yum install ntp -y  
+
+#config the ntp
+#sed -i "s/^server/#server/g" /etc/ntp.conf
+#sed -i "s/restrict default nomodify notrap nopeer noquery/restrict default nomodify/g" /etc/ntp.conf
+#echo "server ${CONTROLLER_NODE_IP} iburst" >> /etc/ntp.conf
+
+echo "start the ntp service"
+systemctl enable ntpd.service
+systemctl start ntpd.service
+systemctl status ntpd.service  
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration keystone service   //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the keystone service"
+/usr/local/bin/controller-node-clear/clear-controller-keystone
+
+#create database
+
+echo 'Create the database'
+if [ "$HostName" == "$MARIADB_NODE_HOSTNAME" -a "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE keystone;  
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$KEYSTON_DB_PASS';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$KEYSTON_DB_PASS';
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE keystone;
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$KEYSTON_DB_PASS';
+GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$KEYSTON_DB_PASS';
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create keystone database failed"; exit 1;fi
+#creat dashboraddb
+if [ "$HostName" == "$MARIADB_NODE_HOSTNAME" -a "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE dashboarddb;
+GRANT ALL PRIVILEGES ON dashboarddb.* TO 'dashboard'@'localhost' IDENTIFIED BY '123456';
+GRANT ALL PRIVILEGES ON dashboarddb.* TO 'dashboard'@'%' IDENTIFIED BY '123456';
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE dashboarddb;
+GRANT ALL PRIVILEGES ON dashboarddb.* TO 'dashboard'@'localhost' IDENTIFIED BY '123456';
+GRANT ALL PRIVILEGES ON dashboarddb.* TO 'dashboard'@'%' IDENTIFIED BY '123456';
+EOF
+fi
+
+#edit /etc/keystone.conf
+echo "edit the keystone config file"
+sed -i "s/#admin_token=ADMIN/admin_token=$ADMIN_USER_TOKEN/g" /etc/keystone/keystone.conf
+
+sed -i "/\[database\]/a \
+connection = mysql://keystone:$KEYSTON_DB_PASS@$MARIADB_NODE_IP/keystone" /etc/keystone/keystone.conf
+
+sed -i "/\[token\]/a \
+provider = keystone.token.providers.uuid.Provider\n\
+driver = keystone.token.persistence.backends.sql.Token\n" /etc/keystone/keystone.conf
+
+#finish keystone setup
+echo "finish the keystone setup"
+keystone-manage pki_setup --keystone-user keystone --keystone-group keystone
+chown -R keystone:keystone /var/log/keystone
+chown -R keystone:keystone /etc/keystone/ssl
+chmod -R o-rwx /etc/keystone/ssl
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+
+echo "start the keystone service"
+systemctl enable openstack-keystone.service
+systemctl start openstack-keystone.service
+systemctl status openstack-keystone.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:start keystone service failed"; exit 1;fi
+
+systemctl enable HGPlatform
+systemctl start HGPlatform
+systemctl status HGPlatform
+
+
+#schedule token purge
+(crontab -l -u keystone 2>&1 | grep -q token_flush) || \
+  echo '@hourly /usr/bin/keystone-manage token_flush >/var/log/keystone/keystone-tokenflush.log 2>&1' \
+  >> /var/spool/cron/keystone
+
+#setup the env variable
+export OS_SERVICE_TOKEN=$ADMIN_USER_TOKEN
+export OS_SERVICE_ENDPOINT=http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0
+echo "OS_SERVICE_TOKEN: $OS_SERVICE_TOKEN\n"
+echo "OS_SERVICE_ENDPOINT: $OS_SERVICE_ENDPOINT\n"
+
+#create users and tenants
+echo "create users and tenants"
+keystone tenant-create --name admin --description "Admin Tenant" 
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create tenant admin failed"; exit 1;fi
+
+keystone user-create --name admin --pass $ADMIN_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create user admin failed"; exit 1;fi
+keystone user-create --name appradmin --pass $ADMIN_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create user appradmin failed"; exit 1;fi
+keystone user-create --name auditadmin --pass $ADMIN_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create user auditadmin failed"; exit 1;fi
+keystone user-create --name sysadmin --pass $ADMIN_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create user sysadmin failed"; exit 1;fi
+keystone user-create --name syncadmin --pass root+-*/root
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create user syncadmin failed"; exit 1;fi
+	
+keystone role-create --name admin
+keystone user-role-add --tenant admin --user admin --role admin
+keystone user-role-add --tenant admin --user appradmin --role admin
+keystone user-role-add --tenant admin --user auditadmin --role admin
+keystone user-role-add --tenant admin --user sysadmin --role admin
+keystone user-role-add --tenant admin --user syncadmin --role admin
+
+keystone tenant-create --name demo --description "Demo Tenant"
+keystone user-create --name demo --tenant demo --pass $DEMO_USER_PASS --email demo@ostack.com
+
+keystone tenant-create --name service --description "Service Tenant"
+keystone service-create --name keystone --type identity --description "OpenStack Identity"
+
+keystone endpoint-create \
+    --service-id $(keystone service-list | awk '/ identity / {print $2}') \
+    --publicurl http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0 \
+    --internalurl http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0 \
+    --adminurl http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0 \
+    --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:keystone:failed:create keystone endpoint failed"; exit 1;fi
+
+unset OS_SERVICE_TOKEN OS_SERVICE_ENDPOINT
+
+echo "Create auth file"
+echo "export OS_TENANT_NAME=admin" > /root/creds
+echo "export OS_USERNAME=admin" >> /root/creds
+echo "export OS_PASSWORD=$ADMIN_USER_PASS" >> /root/creds
+echo "export OS_AUTH_URL=http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0" >> /root/creds
+source /root/creds
+
+send-service-report "$HostName:keystone:success"
+

@@ -1,0 +1,27 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+
+#Stop all service
+echo "Stop Horizon Service"
+
+echo "Stop http service"
+systemctl status httpd.service &> /dev/null && systemctl stop httpd.service
+
+echo "Stop memcached service"
+systemctl status memcached.service && systemctl stop memcached.service
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_HORIZON_CONFIG_DIR=/etc/openstack/service/openstack-dashboard
+#Reset Horizon Config File
+echo "Reset Horizon config file"
+if [ -d "$OPENSTACK_HORIZON_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_HORIZON_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/openstack-dashboard $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+
+

@@ -1,0 +1,55 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+HostName=`hostname`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+#Stop nova service
+echo "Stop nova Service"
+
+echo "Stop openstack-nova-api service"
+systemctl status openstack-nova-api.service &> /dev/null && systemctl stop openstack-nova-api.service
+
+echo "Stop openstack-nova-consoleauth service"
+systemctl status openstack-nova-consoleauth.service &> /dev/null && systemctl stop openstack-nova-consoleauth.service
+
+echo "Stop openstack-nova-cert service"
+systemctl status openstack-nova-cert.service &> /dev/null && systemctl stop openstack-nova-cert.service
+
+echo "Stop openstack-nova-scheduler service"
+systemctl status openstack-nova-scheduler.service &> /dev/null && systemctl stop openstack-nova-scheduler.service
+
+echo "Stop openstack-nova-conductor service"
+systemctl status openstack-nova-conductor.service &> /dev/null && systemctl stop openstack-nova-conductor.service
+
+echo "Stop openstack-nova-novncproxy service"
+systemctl status openstack-nova-novncproxy.service &> /dev/null && systemctl stop openstack-nova-novncproxy.service
+
+#Delete databases
+echo "Delete nova databases"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+DROP DATABASE nova;
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+DROP DATABASE nova;
+FLUSH PRIVILEGES;
+EOF
+fi
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_NOVA_CONFIG_DIR=/etc/openstack/service/nova
+#Reset Nova Config File
+echo "Reset Nova config file"
+if [ -d "$OPENSTACK_NOVA_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_NOVA_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/nova $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+
+

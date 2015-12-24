@@ -1,0 +1,107 @@
+#!/bin/bash
+
+ALL_HOST_NAME=`cat /etc/hosts | awk  -F ' '  '{print $2}' | grep -v 'localhost' | grep -v 'master.server.com'`
+CEPH_CLUSTER_HOST_NAME=""
+for hostname in $ALL_HOST_NAME;do
+    if [ "${hostname:0:4}" == "ceph" ];then
+        CEPH_CLUSTER_HOST_NAME+="$hostname "
+    fi
+done
+
+if [ -z "$CEPH_CLUSTER_HOST_NAME" ]; then
+    exit 0
+fi
+
+CEPH_HOST_NAME_LIST=""
+MON_HOST_NAME_LIST=""
+MDS_HOST_NAME_LIST=""
+MON_HOST_NUM=2
+
+#获取ceph的集群列表
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    CEPH_HOST_NAME_LIST+=" $cephhostname"
+done
+
+#获取监控和元数据主机的列表（默认为两个）
+for((i=1;i<=$MON_HOST_NUM;i++));do
+    MON_HOST_NAME=`echo $CEPH_HOST_NAME_LIST | cut -d " " -f$i`
+    if [ -n "$MON_HOST_NAME" ];then
+        echo $MON_HOST_NAME
+        MON_HOST_NAME_LIST+=" $MON_HOST_NAME"
+        MDS_HOST_NAME_LIST+=" $MON_HOST_NAME"
+    fi
+done
+
+
+#创建 MON 集群
+ceph-deploy --overwrite-conf new $MON_HOST_NAME_LIST
+echo "osd pool default size = 2" >> /home/ceph/ceph.conf
+echo "osd pool default min size =1" >> /home/ceph/ceph.conf
+
+ceph-deploy --overwrite-conf mon create $MON_HOST_NAME_LIST
+ceph-deploy --overwrite-conf mon create-initial
+
+
+#清除osd的挂载路径
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    ssh $cephhostname sudo rm -rf /var/local/osd0
+    ssh $cephhostname sudo mkdir /var/local/osd0
+
+    #ssh $cephhostname sudo rm -rf /data/osd
+    #ssh $cephhostname sudo mkdir -pv /data/osd
+done
+
+
+#在各节点上添加 OSD
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    ceph-deploy --overwrite-conf osd prepare $cephhostname:/var/local/osd0
+    ceph-deploy --overwrite-conf osd activate $cephhostname:/var/local/osd0
+
+    #for disk in $@; do
+    #    ceph-deploy --overwrite-conf osd prepare $cephhostname:/data/osd:$disk
+    #    ceph-deploy --overwrite-conf osd activate $cephhostname:/data/osd:$disk 
+    #done
+done
+
+#将 Admin key 复制到其余各个节点
+ceph-deploy --overwrite-conf admin $CEPH_HOST_NAME_LIST
+
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    ssh $cephhostname sudo chmod +r /etc/ceph/ceph.client.admin.keyring
+done
+
+
+#安装 MDS 集群
+ceph-deploy --overwrite-conf mds create $MDS_HOST_NAME_LIST
+
+
+#查看 MON 集群状态
+echo "mon cluster status:"
+ceph mon_status
+
+
+#完成后查看 OSD 状态
+echo "osd cluster tree:"
+ceph osd tree
+
+
+#查看MDS集群状态
+echo "mds cluster status:"
+ceph mds stat
+
+
+#查看健康状态
+echo "ceph health:"
+ceph health
+
+
+
+
+
+
+
+
+
+
+
+

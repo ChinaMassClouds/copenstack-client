@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install zabbix"
+rpm -q zabbix-agent &> /dev/null || yum install zabbix-agent -y
+
+sed -i "s/Server=.*/Server=$ZABBIX_HOST_IP/g" /etc/zabbix/zabbix_agentd.conf
+sed -i "s/ServerActive=.*/ServerActive=$ZABBIX_HOST_IP/g" /etc/zabbix/zabbix_agentd.conf
+sed -i "s/Hostname=.*/Hostname=$ZABBIX_HOST_NAME/g" /etc/zabbix/zabbix_agentd.conf
+sed -i '/^HostMetadata/d' /etc/zabbix/zabbix_agentd.conf
+echo "HostMetadata=vcent" >> /etc/zabbix/zabbix_agentd.conf
+
+

@@ -1,0 +1,313 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+source /root/creds
+HostName=`hostname`
+
+#mv cobbler-config.repo
+
+mv /etc/yum.repos.d/cobbler-config.repo /etc/yum.repos.d/cobbler-config.repo_bak
+
+#临时注释
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "//////////////////////////    configuration gre network node ////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+rpm -q openvswitch &> /dev/null || yum install openvswitch ntp -y
+
+ntpdate $CONTROLLER_NODE_IP
+
+#config the ntp
+#sed -i "s/^server/#server/g" /etc/ntp.conf
+#echo "server ${CONTROLLER_IP} iburst" >> /etc/ntp.conf
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+
+if [ "$DATA_NETWORKCARD_NAME" != "$MANAGE_NETWORKCARD_NAME" ]; then
+    for i in $(ls /sys/class/net); do
+        NIC=$i
+        MY_MAC=$(cat /sys/class/net/$i/address)
+        #临时注释
+        if [ "$NIC" == "$DATA_NETWORKCARD_NAME" ]; then
+        #if [ "$(cat /sys/class/net/$i/ifindex)" == '3' ]; then
+            if [ -e /etc/sysconfig/network-scripts/ifcfg-$NIC ]; then
+                #grep 'ONBOOT=no' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                #if [ $? ]; then
+                sed -i "s/BOOTPROTO=none/BOOTPROTO=static/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed -i "s/dhcp/static/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed -i "s/ONBOOT=no/ONBOOT=yes/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed  -i '/IPADDR=/d' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed  -i '/NETMASK=/d' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                echo "IPADDR=$NETWORK_NODE_TUNNEL_IP" >> /etc/sysconfig/network-scripts/ifcfg-$NIC
+                echo "NETMASK=$NETWORK_NODE_TUNNEL_NETMASK" >> /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifdown /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifup /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifconfig $NIC
+                #fi
+            fi
+        fi
+    done
+fi 
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration neutron service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+rpm -q openstack-neutron &> /dev/null || yum install openstack-neutron openstack-neutron-ml2 openstack-neutron-openvswitch -y
+
+if [ "$THISHOST_IP" == "$CONTROLLER_NODE_IP" ];then
+    chmod +x /usr/local/bin/network-node-clear/clear-network-gre-node
+    /usr/local/bin/network-node-clear/clear-network-gre-node allinone
+else
+    chmod +x /usr/local/bin/network-node-clear/clear-network-gre-node
+    /usr/local/bin/network-node-clear/clear-network-gre-node
+fi
+
+if [ "$THISHOST_IP" == "$CONTROLLER_NODE_IP" ];then
+    if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+        mysql -u root <<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$NEUTRON_DB_PASS';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$NEUTRON_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+    else
+        mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$NEUTRON_DB_PASS';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$NEUTRON_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+    fi
+
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron database failed"; exit 1;fi
+
+    echo "Create keystone entries for neutron"
+    keystone user-list | grep neutron &> /dev/null && keystone user-delete neutron
+    for ID in `keystone service-list | grep neutron | awk '{print $2}'`;do keystone service-delete $ID; done
+
+    keystone user-create --name neutron --pass $NEUTRON_USER_PASS
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron user failed"; exit 1;fi
+
+    keystone user-role-add --user neutron --tenant service --role admin
+    keystone service-create --name neutron --type network --description "OpenStack Networking"
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron service failed"; exit 1;fi
+
+    keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ network / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --region regionOne
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron endpoint failed"; exit 1;fi
+fi
+
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.conf  
+echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf  
+echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+
+sysctl -p  
+
+echo "Create auth file"
+echo "export OS_TENANT_NAME=admin" > /root/creds
+echo "export OS_USERNAME=admin" >> /root/creds
+echo "export OS_PASSWORD=$ADMIN_USER_PASS" >> /root/creds
+echo "export OS_AUTH_URL=http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0" >> /root/creds
+source /root/creds
+
+echo "Edit the config file"
+sed -i "/\[database\]/a \
+connection = mysql://neutron:$NEUTRON_DB_PASS@$MARIADB_NODE_IP/neutron" /etc/neutron/neutron.conf
+
+SERVICE_TENANT_ID=$(keystone tenant-list | awk '/ service / {print $2}')
+
+sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+core_plugin = ml2\n\
+service_plugins = router\n\
+allow_overlapping_ips = True\n\
+verbose = True\n\
+notify_nova_on_port_status_changes = True\n\
+notify_nova_on_port_data_changes = True\n\
+nova_url = http:\/\/$CONTROLLER_NODE_HOSTNAME:8774\/v2\n\
+nova_admin_auth_url = http:\/\/$CONTROLLER_NODE_HOSTNAME:35357\/v2.0\n\
+nova_region_name = regionOne\n\
+nova_admin_username = nova\n\
+nova_admin_tenant_id = $SERVICE_TENANT_ID\n\
+nova_admin_password = $NOVA_USER_PASS" /etc/neutron/neutron.conf
+
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/neutron/neutron.conf
+
+
+#edit /etc/neutron/plugins/ml2/ml2_conf.ini
+sed -i "/\[ml2\]/a \
+type_drivers = gre\n\
+tenant_network_types = gre\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+sed -i "/\[ml2_type_gre\]/a \
+tunnel_id_ranges = 1:1000" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+#sed -i "/\[ml2_type_flat\]/a \
+#flat_networks = external" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+if [ "$MANAGE_DATA_NET_INONE" == "true" ]; then
+    NETWORK_NODE_TUNNEL_IP=$NETWORK_NODE_IP
+fi
+
+sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver\n\
+[ovs]\n\
+local_ip = $NETWORK_NODE_TUNNEL_IP\n\
+enable_tunneling = True\n\
+bridge_mappings = external:br-ex\n\
+[agent]\n\
+tunnel_types = gre" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+sed -i "/^\[DEFAULT\]$/a \
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver\n\
+use_namespaces = True\n\
+router_delete_namespaces = True\n\
+verbose = True\n\
+external_network_bridge = br-ex" /etc/neutron/l3_agent.ini
+
+sed -i "/^\[DEFAULT\]$/a \
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver\n\
+dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq\n\
+dhcp_delete_namespaces = True\n\
+verbose=True\n\
+use_namespaces = True" /etc/neutron/dhcp_agent.ini
+
+
+sed -i "s/auth_url/#auth_url/g" /etc/neutron/metadata_agent.ini
+sed -i "s/auth_region/#auth_region/g" /etc/neutron/metadata_agent.ini
+sed -i "s/admin_tenant_name/#admin_tenant_name/g" /etc/neutron/metadata_agent.ini
+sed -i "s/admin_user/#admin_user/g" /etc/neutron/metadata_agent.ini
+sed -i "s/admin_password/#admin_password/g" /etc/neutron/metadata_agent.ini
+
+sed -i "/^\[DEFAULT\]$/a \
+auth_url = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+auth_region = regionOne\n\
+admin_tenant_name = service\n\
+admin_user = neutron\n\
+admin_password = $NEUTRON_USER_PASS\n\
+nova_metadata_ip = $CONTROLLER_NODE_HOSTNAME\n\
+verbose=True\n\
+metadata_proxy_shared_secret = $META_PWD" /etc/neutron/metadata_agent.ini
+
+
+echo "get external NIC info"
+INT_INTERFACE_INDEX=4
+if [ "$MANAGE_DATA_NET_INONE" == 'true' ]; then
+    INT_INTERFACE_INDEX=3
+fi
+
+echo "INT_INTERFACE_INDEX:$INT_INTERFACE_INDEX"
+
+for i in $(ls /sys/class/net); do
+    #临时注释
+    if [ "$i" == "$EXTERNAL_NETWORKCARD_NAME" ]; then
+    #if [ "$(cat /sys/class/net/$i/ifindex)" == "$INT_INTERFACE_INDEX" ]; then
+        NIC=$i
+        MY_MAC=$(cat /sys/class/net/$i/address)
+        echo "$i ($MY_MAC)"
+        sed -i "s/dhcp/none/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+        sed -i "s/static/none/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+        sed -i "s/ONBOOT=no/ONBOOT=yes/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+    fi
+done
+
+echo "The NIC is: $NIC"
+systemctl enable openvswitch.service
+systemctl start openvswitch.service
+ovs-vsctl add-br br-ex
+ovs-vsctl add-port br-ex $EXTERNAL_NETWORKCARD_NAME
+ethtool -K $NIC gro off
+
+
+if [ -f "/etc/neutron/plugin.ini" ]; then
+    rm -rf /etc/neutron/plugin.ini
+fi
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+cp -rf /usr/lib/systemd/system/neutron-openvswitch-agent.service \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service.orig
+sed -i 's,plugins/openvswitch/ovs_neutron_plugin.ini,plugin.ini,g' \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service
+
+if [ "$THISHOST_IP" == "$CONTROLLER_NODE_IP" ];then
+    su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade juno" neutron
+
+    systemctl restart openstack-nova-api.service
+    systemctl status openstack-nova-api.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-api service failed"; exit 1;fi
+
+    systemctl restart openstack-nova-scheduler.service
+    systemctl status openstack-nova-scheduler.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-scheduler service failed"; exit 1;fi
+
+    systemctl restart openstack-nova-conductor.service
+    systemctl status openstack-nova-conductor.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-conductor service failed"; exit 1;fi
+
+    systemctl enable neutron-server.service
+    systemctl start neutron-server.service
+    systemctl status neutron-server.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start neutron-server service failed"; exit 1;fi
+fi
+
+systemctl enable neutron-openvswitch-agent.service neutron-l3-agent.service \
+neutron-dhcp-agent.service neutron-metadata-agent.service neutron-ovs-cleanup.service
+
+systemctl start neutron-l3-agent.service
+systemctl status neutron-l3-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron-gre-node:failed:start neutron-l3-agent service failed"; exit 1;fi
+
+systemctl start neutron-dhcp-agent.service
+systemctl status neutron-dhcp-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron-gre-node:failed:start neutron-dhcp-agent service failed"; exit 1;fi
+
+systemctl start neutron-metadata-agent.service
+systemctl status neutron-metadata-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron-gre-node:failed:start neutron-metadata-agent service failed"; exit 1;fi
+
+systemctl start openvswitch.service
+systemctl status openvswitch.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron-gre-node:failed:start openvswitch service failed"; exit 1;fi
+
+systemctl start neutron-openvswitch-agent.service
+systemctl status neutron-openvswitch-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron-gre-node:failed:start neutron-openvswitch-agent service failed"; exit 1;fi
+
+send-service-report "$HostName:neutron-gre-node:success"
+

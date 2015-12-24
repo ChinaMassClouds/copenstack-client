@@ -1,0 +1,126 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install cinder service"
+rpm -q openstack-cinder &> /dev/null || yum install openstack-cinder python-cinderclient python-oslo-db targetcli MySQL-python -y
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration cinder service   //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the cinder service"
+/usr/local/bin/controller-node-clear/clear-controller-cinder
+
+echo "Create the cinder database"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE cinder;
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY '$CINDER_DB_PASS';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'%' IDENTIFIED BY '$CINDER_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE cinder;
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY '$CINDER_DB_PASS';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'%' IDENTIFIED BY '$CINDER_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinder database failed"; exit 1;fi
+
+echo "Create keystone entries for cinder"
+keystone user-list | grep cinder &> /dev/null && keystone user-delete cinder
+for ID in `keystone service-list | grep cinder | awk '{print $2}'`;do keystone service-delete $ID; done
+for ID in `keystone service-list | grep cinderv2 | awk '{print $2}'`;do keystone service-delete $ID; done
+
+keystone user-create --name cinder --pass $CINDER_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinder user failed"; exit 1;fi
+
+keystone user-role-add --user cinder --tenant service --role admin
+keystone service-create --name cinder --type volume \
+  --description "OpenStack Block Storage"
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinder service failed"; exit 1;fi
+
+keystone service-create --name cinderv2 --type volumev2 \
+  --description "OpenStack Block Storage"
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinderv2 service failed"; exit 1;fi
+
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ volume / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8776/v1/%\(tenant_id\)s \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8776/v1/%\(tenant_id\)s \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8776/v1/%\(tenant_id\)s \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinder endpoint volume failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ volumev2 / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8776/v2/%\(tenant_id\)s \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8776/v2/%\(tenant_id\)s \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8776/v2/%\(tenant_id\)s \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:create cinder endpoint volumev2 failed"; exit 1;fi
+
+echo "Edit the cinder config file"
+sed -i "/\[database\]/a \
+connection = mysql://cinder:$CINDER_DB_PASS@$MARIADB_NODE_IP/cinder" /etc/cinder/cinder.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+control_exchange = cinder\n\
+notification_driver = cinder.openstack.common.notifier.rpc_notifier\n\
+my_ip = $THISHOST_IP" /etc/cinder/cinder.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = cinder\n\
+admin_password = $CINDER_USER_PASS" /etc/cinder/cinder.conf
+
+su -s /bin/sh -c "cinder-manage db sync" cinder
+
+systemctl enable openstack-cinder-api.service openstack-cinder-scheduler.service
+
+systemctl start openstack-cinder-api.service 
+systemctl status openstack-cinder-api.service 
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:start openstack-cinder-api service failed"; exit 1;fi
+
+systemctl start openstack-cinder-scheduler.service
+systemctl status openstack-cinder-scheduler.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder:failed:start openstack-cinder-scheduler failed"; exit 1;fi
+
+send-service-report "$HostName:cinder:success"
+
+

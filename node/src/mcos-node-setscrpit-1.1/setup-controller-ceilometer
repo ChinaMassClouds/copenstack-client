@@ -1,0 +1,149 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+rpm -q mongodb &> /dev/null || yum install mongodb -y
+rpm -q openstack-ceilometer-api &> /dev/null || yum install openstack-ceilometer-api -y  
+rpm -q openstack-ceilometer-collector &> /dev/null || yum install openstack-ceilometer-collector -y  
+rpm -q openstack-ceilometer-central &> /dev/null || yum install openstack-ceilometer-central -y
+rpm -q openstack-ceilometer-notification &> /dev/null || yum install openstack-ceilometer-notification -y 
+rpm -q openstack-ceilometer-alarm &> /dev/null || yum install openstack-ceilometer-alarm  python-ceilometerclient openstack-ceilometer-compute python-pecan -y 
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration ceilometer service   //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the ceilometer service"
+/usr/local/bin/controller-node-clear/clear-controller-ceilometer
+
+echo "Create keystone entries for glance"
+keystone user-list | grep ceilometer &> /dev/null && keystone user-delete ceilometer
+for ID in `keystone service-list | grep ceilometer | awk '{print $2}'`;do keystone service-delete $ID; done
+
+keystone user-create --name ceilometer --pass $CEILOMETER_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:ceilometer:failed:create ceilometer user failed"; exit 1;fi
+
+keystone user-role-add --user ceilometer --tenant service --role admin
+keystone service-create --name ceilometer --type metering \
+  --description "OpenStack metering Service"
+if [ $? -gt 0 ]; then send-service-report "$HostName:ceilometer:failed:create ceilometer service failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ metering / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8777 \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8777 \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8777 \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:ceilometer:failed:create ceilometer endpoint failed"; exit 1;fi
+
+echo "Edit the glance config file"
+sed -i "/\[database\]/a \
+connection = mongodb://ceilometer:$CEILOMETER_DB_PASS@$MONGODB_DATABASE_HOSTNAME:27017/ceilometer" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = ceilometer\n\
+admin_password = $CEILOMETER_USER_PASS" /etc/ceilometer/ceilometer.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+verbose = True" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[service_credentials\]/a \
+os_auth_url = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+os_username = ceilometer\n\
+os_tenant_name = service\n\
+os_password = $CEILOMETER_USER_PASS\n\
+os_endpoint_type = internalURL" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[publisher\]/a \
+metering_secret = lkl_metering_key" /etc/ceilometer/ceilometer.conf
+
+OLD_IFS="$IFS"
+IFS=" "
+arr=($COMPUTE_NODE_LIST)
+IFS="$OLD_IFS"
+MONITOR_HOST_INFO=""
+for s in ${arr[@]}
+do
+    MONITOR_HOST_INFO=${MONITOR_HOST_INFO}"         - snmp://$s\n"
+done
+
+sed -i "/^sources:/a \    - name: hardware_memory_source\n\      interval: 600\n\      meters:\n\         - 'hardware.memory.*'\n\         - 'hardware.cpu.*'\n\         - 'hardware.disk.size.total'\n\         - 'hardware.disk.size.used'\n\      resources:\n$MONITOR_HOST_INFO\      sinks:\n         - meter_sink" /etc/ceilometer/pipeline.yaml
+
+sed -i "/- \"cpu\"/a \          - \"cpu_util\"" /etc/ceilometer/pipeline.yaml
+
+systemctl enable openstack-ceilometer-api.service openstack-ceilometer-notification.service \
+openstack-ceilometer-central.service openstack-ceilometer-collector.service \
+openstack-ceilometer-alarm-evaluator.service openstack-ceilometer-alarm-notifier.service
+
+systemctl start openstack-ceilometer-api.service 
+systemctl status openstack-ceilometer-api.service 
+
+systemctl start openstack-ceilometer-notification.service 
+systemctl status openstack-ceilometer-notification.service 
+
+systemctl start openstack-ceilometer-central.service 
+systemctl status openstack-ceilometer-central.service 
+
+systemctl start openstack-ceilometer-collector.service
+systemctl status openstack-ceilometer-collector.service
+
+systemctl start openstack-ceilometer-alarm-evaluator.service
+systemctl status openstack-ceilometer-alarm-evaluator.service
+
+systemctl start openstack-ceilometer-alarm-notifier.service
+systemctl status openstack-ceilometer-alarm-notifier.service
+
+#部署配置测量服务计算服务代理
+systemctl enable openstack-ceilometer-compute.service  
+systemctl start openstack-ceilometer-compute.service  
+systemctl status openstack-ceilometer-compute.service  
+
+systemctl restart openstack-glance-api.service openstack-glance-registry.service
+systemctl status openstack-glance-api.service openstack-glance-registry.service
+
+systemctl restart openstack-cinder-api.service openstack-cinder-scheduler.service
+systemctl status openstack-cinder-api.service openstack-cinder-scheduler.service
+
+ceilometer meter-list
+#if [ $? -gt 0 ]; then 
+#    send-service-report "$HostName:ceilometer:failed:create ceilometer service failed"; 
+#    exit 1;
+#else
+#    send-service-report "$HostName:ceilometer:success";
+#fi
+chmod 755 /etc/ceilometer/ceilometer.conf
+
+systemctl status HGPlatform &> /dev/null ||  systemctl restart HGPlatform
+
+send-service-report "$HostName:ceilometer:success";
+

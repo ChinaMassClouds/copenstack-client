@@ -1,0 +1,50 @@
+#!/bin/bash
+
+for i in $(ls /sys/class/net); do
+    NIC=$i
+    if [ "$NIC" != "lo" ];then
+        grep "IPADDR" /etc/sysconfig/network-scripts/ifcfg-$NIC &> /dev/null
+        if [ $? -eq 0 ]; then
+            exit 0
+        fi
+    fi
+done
+
+MANAGE_NET_INTERFACE=''
+NET_INTERFACE_LIST=`facter | grep interfaces | awk -F ' => ' '{print $2}'`
+OLD_IFS="$IFS"
+IFS=","
+arr=($NET_INTERFACE_LIST)
+IFS="$OLD_IFS"
+THISHOST_IP=""
+NIC=""
+for s in ${arr[@]};
+do
+    if [ "$s" != "lo" ];then
+        echo "$s";
+        NET_INTERFACE_NAME=$s;
+        IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+        if [ -n "$IP" ]; then
+            THISHOST_IP=$IP;
+            NIC=$s;
+            THISHOST_NETMASK=`facter | grep netmask_$NIC | awk -F ' => ' '{print $2}'`
+            break
+        fi
+    fi
+done
+
+if [ -n "$THISHOST_IP" ]; then
+    gateway=`netstat -r|grep default | grep $NIC | cut -f 10 -d ' '`
+    sed -i "s/dhcp/static/g" /etc/sysconfig/network-scripts/ifcfg-$NIC;
+    sed -i "s/ONBOOT=no/ONBOOT=yes/g" /etc/sysconfig/network-scripts/ifcfg-$NIC;
+    echo "IPADDR=$THISHOST_IP" >> /etc/sysconfig/network-scripts/ifcfg-$NIC;
+    echo "NETMASK=$THISHOST_NETMASK" >> /etc/sysconfig/network-scripts/ifcfg-$NIC;
+    echo "DNS1=114.114.114.114" >> /etc/sysconfig/network-scripts/ifcfg-$NIC;
+
+    if [ -n "$gateway" ]; then
+        echo "GATEWAY=$gateway" >> /etc/sysconfig/network-scripts/ifcfg-$NIC;
+    fi
+
+    systemctl restart network;
+fi
+

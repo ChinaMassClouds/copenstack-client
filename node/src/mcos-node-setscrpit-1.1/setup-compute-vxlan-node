@@ -1,0 +1,364 @@
+#!/bin/bash
+
+#get the config file
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration compute node ////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+rpm -q openstack-nova-compute &> /dev/null || yum install qemu-kvm libvirt openstack-nova-compute sysfsutils -y
+rpm -q openstack-nova-spicehtml5proxy &> /dev/null || yum install spice-html5 openstack-nova-spicehtml5proxy -y
+rpm -q sysfsutils &> /dev/null || yum install sysfsutils -y
+rpm -q openstack-neutron-ml2 &> /dev/null || yum install openstack-neutron-ml2 openstack-neutron-openvswitch -y
+
+rpm -q openstack-cinder &> /dev/null || yum install openstack-cinder -y
+rpm -q python-oslo-db &> /dev/null || yum install python-oslo-db -y
+rpm -q MySQL-python &> /dev/null || yum install MySQL-python -y
+rpm -q openstack-ceilometer-compute &> /dev/null || yum install openstack-ceilometer-compute -y
+rpm -q pymongo &> /dev/null || yum install pymongo -y
+
+echo "yum install ntp"
+rpm -q ntp &> /dev/null || yum install ntp -y
+
+ntpdate $CONTROLLER_NODE_IP
+
+echo "clear the config"
+/usr/local/bin/compute-node-clear/clear-compute-node
+
+#stop firewall service
+echo "Stop firewall service"
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+#close selinux
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+setenforce 0
+
+if [ "$DATA_NETWORKCARD_NAME" != "$MANAGE_NETWORKCARD_NAME" ]; then
+    for i in $(ls /sys/class/net); do
+        NIC=$i
+        MY_MAC=$(cat /sys/class/net/$i/address)
+        if [ "$NIC" == "$DATA_NETWORKCARD_NAME" ]; then
+        #if [ "$(cat /sys/class/net/$i/ifindex)" == '3' ]; then
+            if [ -e /etc/sysconfig/network-scripts/ifcfg-$NIC ]; then
+                #grep 'ONBOOT=no' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                #if [ $? ]; then
+                sed -i "s/BOOTPROTO=none/BOOTPROTO=static/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed -i "s/dhcp/static/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed -i "s/ONBOOT=no/ONBOOT=yes/g" /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed  -i '/IPADDR=/d' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                sed  -i '/NETMASK=/d' /etc/sysconfig/network-scripts/ifcfg-$NIC
+                echo "IPADDR=$NETWORK_NODE_TUNNEL_IP" >> /etc/sysconfig/network-scripts/ifcfg-$NIC
+                echo "NETMASK=$NETWORK_NODE_TUNNEL_NETMASK" >> /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifdown /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifup /etc/sysconfig/network-scripts/ifcfg-$NIC
+                ifconfig $NIC
+                #fi
+            fi
+        fi
+    done
+fi
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration nova service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+NOVA_INSTANCE_PATH=/home/openstack_nova/nova/instances
+if [ ! -d $NOVA_INSTANCE_PATH ]; then
+    mkdir -pv $NOVA_INSTANCE_PATH;
+    cp -a /var/lib/nova /home/openstack_nova/
+    chown -R nova:nova /home/openstack_nova/nova
+fi
+
+if [ "$COMPUTE_VM_STORE_TYPE" == "nfs" ]; then
+    sed -i '/\/home\/openstack_nova\/nova\/instances/d' /etc/fstab
+    echo "$NFS_NODE_HOSTNAME:/home/openstack_data/nova/instances /home/openstack_nova/nova/instances nfs rw,soft 0 0" >> /etc/fstab
+    umount /home/openstack_nova/nova/instances
+    mount -t nfs $NFS_NODE_HOSTNAME:/home/openstack_data/nova/instances /home/openstack_nova/nova/instances
+    chown -R nova:nova /home/openstack_nova/nova
+fi
+
+echo "Edit the nova config file"
+
+
+sed -i "/\[DEFAULT\]/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+my_ip = $THISHOST_IP\n\
+instance_usage_audit = True\n\
+instance_usage_audit_period = hour\n\
+notify_on_state_change = vm_and_task_state\n\
+notification_driver = nova.openstack.common.notifier.rpc_notifier\n\
+notification_driver = ceilometer.compute.nova_notifier\n\
+vif_plugging_timeout = 10\n\
+vif_plugging_is_fatal = False\n\
+instances_path = /home/openstack_nova/nova/instances\n\
+vnc_enabled = True\n\
+verbose = True\n\
+vncserver_listen = 0.0.0.0\n\
+vncserver_proxyclient_address = $THISHOST_IP\n\
+novncproxy_base_url = http://$CONTROLLER_NODE_HOSTNAME:6080/vnc_auto.html\n\
+network_api_class = nova.network.neutronv2.api.API\n\
+security_group_api = neutron\n\
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver\n\
+firewall_driver = nova.virt.firewall.NoopFirewallDriver" /etc/nova/nova.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = nova\n\
+admin_password = $NOVA_USER_PASS" /etc/nova/nova.conf
+
+sed -i "/\[spice\]/a \
+html5proxy_base_url = http://$THISHOST_IP:6082/spice_auto.html\n\
+server_listen = 0.0.0.0\n\
+server_proxyclient_address = $THISHOST_IP\n\
+enabled = true\n\
+agent_enabled = true\n\
+usbredir_channels=4" /etc/nova/nova.conf
+
+sed -i "/\[glance\]/a host = $CONTROLLER_NODE_HOSTNAME" /etc/nova/nova.conf
+
+echo "add custom support spice file"
+cp -rf /usr/local/include/massclouds_console.py /usr/lib/python2.7/site-packages/nova/api/openstack/compute/contrib/
+
+#if compute node is virtual - change virt_type to qemu
+if [ $(egrep -c '(vmx|svm)' /proc/cpuinfo) == "0" ]; then
+    sed -i '/\[libvirt\]/a virt_type = qemu' /etc/nova/nova.conf
+fi
+
+#set ceilometer monitor vm memory usage
+sed -i '/\[libvirt\]/a mem_stats_period_seconds=10' /etc/nova/nova.conf
+
+#set the libvirt config file
+sed -i "s/#LIBVIRTD_ARGS=\"--listen\"/LIBVIRTD_ARGS=\"--listen\"/g" /etc/sysconfig/libvirtd
+sed -i "s/#listen_tls = 0/listen_tls = 0/g" /etc/libvirt/libvirtd.conf
+sed -i "s/#listen_tcp = 1/listen_tcp = 1/g" /etc/libvirt/libvirtd.conf
+sed -i "s/#auth_tcp = \"sasl\"/auth_tcp = \"none\"/g" /etc/libvirt/libvirtd.conf
+
+UUID=`uuidgen`
+sed -i "/#host_uuid/a host_uuid = \"$UUID\"" /etc/libvirt/libvirtd.conf
+
+#host_uuid = "00000000-0000-0000-0000-000000000000"
+
+
+#Start openstack-nova-compute service 
+echo "Start openstack-nova-compute service"
+systemctl enable libvirtd.service openstack-nova-compute.service  
+systemctl start libvirtd.service 
+systemctl status libvirtd.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-vxlan:failed:start libvirtd service failed"; exit 1;fi
+
+systemctl start openstack-nova-compute.service  
+systemctl status openstack-nova-compute.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-vxlan:failed:start openstack-nova-compute service failed"; exit 1;fi
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration neutron service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+#config ipv4 
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.conf
+echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf
+echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+
+sysctl -p
+
+sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+verbose = True\n\
+auth_strategy = keystone\n\
+core_plugin = ml2\n\
+service_plugins = router\n\
+allow_overlapping_ips = True" /etc/neutron/neutron.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/neutron/neutron.conf
+
+if [ "$MANAGE_DATA_NET_INONE" == "true" ]; then     
+    NETWORK_NODE_TUNNEL_IP=$THISHOST_IP
+fi
+
+sed -i "/\[ml2\]/a \
+type_drivers = flat,vxlan\n\
+tenant_network_types = vxlan\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+sed -i "/\[ml2_type_vxlan\]/a \
+vni_ranges = $VXLAN_ID_BEGIN_VALUE:$VXLAN_ID_END_VALUE" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver\n\
+[ovs]\n\
+local_ip = $NETWORK_NODE_TUNNEL_IP\n\
+enable_tunneling = True\n\
+[agent]\n\
+tunnel_types = vxlan" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+sed -i "/^\[DEFAULT\]$/a \
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver\n\
+dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq\n\
+use_namespaces = True\n\
+verbose = True\n\
+dhcp_delete_namespaces = True" /etc/neutron/dhcp_agent.ini
+
+
+
+echo "Start openvswitch service"
+systemctl enable openvswitch.service
+systemctl start openvswitch.service
+
+echo "Edit nova config file"
+
+
+sed -i "/\[neutron\]/a \
+url = http://$CONTROLLER_NODE_HOSTNAME:9696\n\
+auth_strategy = keystone\n\
+admin_auth_url = http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0\n\
+admin_tenant_name = service\n\
+admin_username = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/nova/nova.conf
+
+#restart openstack-nova-compute service 
+echo "Start openstack-nova-compute service"
+systemctl restart openstack-nova-compute.service
+systemctl status openstack-nova-compute.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-vxlan:failed:start openstack-nova-compute service failed"; exit 1;fi
+
+rm -rf /etc/neutron/plugin.ini
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+cp /usr/lib/systemd/system/neutron-openvswitch-agent.service \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service.orig
+sed -i 's,plugins/openvswitch/ovs_neutron_plugin.ini,plugin.ini,g' \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service
+
+echo "Start neutron-openvswitch-agent service"
+systemctl enable neutron-openvswitch-agent.service
+systemctl start neutron-openvswitch-agent.service
+systemctl status neutron-openvswitch-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-vxlan:failed:start neutron-openvswitch-agent service failed"; exit 1;fi
+
+echo "Start neutron-dhcp-agent servcie"
+systemctl enable neutron-dhcp-agent.service
+systemctl start neutron-dhcp-agent.service
+systemctl status neutron-dhcp-agent.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-vxlan:failed:start neutron-dhcp-agent service failed"; exit 1;fi
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration cinder volume service   /////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "Edit the cinder config file"
+sed -i "/\[database\]/a \
+connection = mysql://cinder:$CINDER_DB_PASS@$MARIADB_NODE_IP/cinder" /etc/cinder/cinder.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+glance_host = $CONTROLLER_NODE_HOSTNAME\n\
+iscsi_helper = lioadm\n\
+my_ip = $THISHOST_IP" /etc/cinder/cinder.conf
+
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = cinder\n\
+admin_password = $CINDER_USER_PASS" /etc/cinder/cinder.conf
+
+
+#send-service-report "$HostName:nova-compute-vxlan:success"
+#echo "Finish the compute node config"
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration ceilometer service   ////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "Edit the glance config file"
+sed -i "/\[database\]/a \
+connection = mongodb://ceilometer:$CEILOMETER_DB_PASS@$MONGODB_DATABASE_HOSTNAME:27017/ceilometer" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = ceilometer\n\
+admin_password = $CEILOMETER_USER_PASS" /etc/ceilometer/ceilometer.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+verbose = True" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[service_credentials\]/a \
+os_auth_url = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+os_username = ceilometer\n\
+os_tenant_name = service\n\
+os_password = $CEILOMETER_USER_PASS\n\
+os_endpoint_type = internalURL" /etc/ceilometer/ceilometer.conf
+
+sed -i "/\[publisher\]/a \
+metering_secret = lkl_metering_key" /etc/ceilometer/ceilometer.conf
+
+
+BEGIN_LINE=`awk '/cpu_source/{print NR}' /etc/ceilometer/pipeline.yaml`
+let END_LINE=${BEGIN_LINE}+4
+sed -i "$END_LINE"i\ "\          - \"cpu_util\"" /etc/ceilometer/pipeline.yaml
+
+systemctl enable openstack-ceilometer-compute.service
+systemctl start openstack-ceilometer-compute.service
+systemctl status openstack-ceilometer-compute.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-gre:failed:start openstack-ceilometer-compute service failed"; exit 1;fi
+
+send-service-report "$HostName:nova-compute-vxlan:success"
+echo "Finish the compute node config"
+

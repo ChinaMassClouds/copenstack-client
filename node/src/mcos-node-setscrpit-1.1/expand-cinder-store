@@ -1,0 +1,17 @@
+#!/bin/bash
+
+HostName=`hostname`
+
+if [ $# -gt 0 ];then
+    for disk in $@; do
+        echo "$disk";
+        pvcreate $disk -y;
+        if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:use $disk create physical volume failed"; exit 1;fi
+        vgextend cinder-volumes $disk;
+        if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:use $disk extend physical volume cinder-volumes failed"; exit 1;fi
+    done
+else
+    exit 1
+fi
+
+send-service-report "$HostName:cinder-volume:success"

@@ -1,0 +1,12 @@
+[Unit]
+Description=nodeUdpInfo
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/usr/local/bin/nodeinfoudp start
+ExecReload=/usr/local/bin/nodeinfoudp restart
+ExecStop=/usr/local/bin/nodeinfoudp stop
+
+[Install]
+WantedBy=multi-user.target

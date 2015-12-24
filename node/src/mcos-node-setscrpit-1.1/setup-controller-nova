@@ -1,0 +1,278 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+mv /etc/yum.repos.d/cobbler-config.repo /etc/yum.repos.d/cobbler-config.repo_bak
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the nova service"
+/usr/local/bin/controller-node-clear/clear-controller-nova
+
+echo "yum install nova service"
+rpm -q openstack-nova-api &> /dev/null || yum install openstack-nova-api openstack-nova-cert  \
+     openstack-nova-conductor openstack-nova-console \
+     openstack-nova-novncproxy openstack-nova-scheduler python-novaclient \
+     openstack-nova-spicehtml5proxy spice-html5 -y
+
+if [ $# -gt 0 -a "$1" == "allinone" ];then
+    rpm -q openstack-nova-compute &> /dev/null || yum install qemu-kvm libvirt openstack-nova-compute sysfsutils -y
+fi
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration nova service   ////////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE nova;
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY '$NOVA_DB_PASS';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' IDENTIFIED BY '$NOVA_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE nova;
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY '$NOVA_DB_PASS';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' IDENTIFIED BY '$NOVA_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:create nova database failed"; exit 1;fi
+
+echo "Create keystone entries for nova"
+keystone user-list | grep nova &> /dev/null && keystone user-delete nova
+for ID in `keystone service-list | grep nova | awk '{print $2}'`;do keystone service-delete $ID; done
+
+keystone user-create --name nova --pass $NOVA_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:create nova user failed"; exit 1;fi
+
+keystone user-role-add --user nova --tenant service --role admin
+keystone service-create --name nova --type compute \
+  --description "OpenStack Compute"
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:create nova service failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ compute / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:8774/v2/%\(tenant_id\)s \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:8774/v2/%\(tenant_id\)s \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:8774/v2/%\(tenant_id\)s \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:create nova endpoint failed"; exit 1;fi
+
+if [ $# -gt 0 -a "$1" == "allinone" ];then
+    NOVA_INSTANCE_PATH=/home/openstack_nova/nova/instances
+    if [ ! -d $NOVA_INSTANCE_PATH ]; then
+        mkdir -pv $NOVA_INSTANCE_PATH;
+        cp -a /var/lib/nova /home/openstack_nova/
+        chown -R nova:nova /home/openstack_nova/nova
+    fi
+
+    if [ "$COMPUTE_VM_STORE_TYPE" == "nfs" ]; then
+        sed -i '/\/home\/openstack_nova\/nova\/instances/d' /etc/fstab
+        echo "$NFS_NODE_HOSTNAME:/home/openstack_data/nova/instances /home/openstack_nova/nova/instances nfs rw,soft 0 0" >> /etc/fstab
+        umount /home/openstack_nova/nova/instances
+        mount -t nfs $NFS_NODE_HOSTNAME:/home/openstack_data/nova/instances /home/openstack_nova/nova/instances
+    fi
+
+    echo "Edit the nova config file"
+    echo -e "[database]\nconnection = mysql://nova:$NOVA_DB_PASS@$MARIADB_NODE_IP/nova" >> /etc/nova/nova.conf
+ 
+    sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+my_ip = $THISHOST_IP\n\
+instance_usage_audit = True\n\
+instance_usage_audit_period = hour\n\
+notify_on_state_change = vm_and_task_state\n\
+notification_driver = nova.openstack.common.notifier.rpc_notifier\n\
+notification_driver = ceilometer.compute.nova_notifier\n\
+vif_plugging_timeout = 10\n\
+vif_plugging_is_fatal = False\n\
+instances_path = /home/openstack_nova/nova/instances\n\
+vnc_enabled = True\n\
+verbose = True\n\
+vncserver_listen = 0.0.0.0\n\
+vncserver_proxyclient_address = $THISHOST_IP\n\
+novncproxy_base_url = http://$CONTROLLER_NODE_HOSTNAME:6080/vnc_auto.html\n\
+network_api_class = nova.network.neutronv2.api.API\n\
+security_group_api = neutron\n\
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver\n\
+firewall_driver = nova.virt.firewall.NoopFirewallDriver" /etc/nova/nova.conf
+
+    sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = nova\n\
+admin_password = $NOVA_USER_PASS" /etc/nova/nova.conf
+
+    sed -i "/\[spice\]/a \
+html5proxy_base_url = http://$THISHOST_IP:6082/spice_auto.html\n\
+server_listen = 0.0.0.0\n\
+server_proxyclient_address = $THISHOST_IP\n\
+enabled = true\n\
+agent_enabled = true\n\
+usbredir_channels=4" /etc/nova/nova.conf
+
+    sed -i "/\[neutron\]/a \
+url = http://$CONTROLLER_NODE_HOSTNAME:9696\n\
+auth_strategy = keystone\n\
+admin_auth_url = http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0\n\
+admin_tenant_name = service\n\
+admin_username = neutron\n\
+admin_password = $NEUTRON_USER_PASS\n\
+service_metadata_proxy = True\n\
+metadata_proxy_shared_secret = $META_PWD" /etc/nova/nova.conf
+
+    sed -i "/\[glance\]/a host = $CONTROLLER_NODE_HOSTNAME" /etc/nova/nova.conf
+
+    echo "add custom support spice file"
+    cp -rf /usr/local/include/massclouds_console.py /usr/lib/python2.7/site-packages/nova/api/openstack/compute/contrib/
+
+    #if compute node is virtual - change virt_type to qemu
+    if [ $(egrep -c '(vmx|svm)' /proc/cpuinfo) == "0" ]; then
+        sed -i '/\[libvirt\]/a virt_type = qemu' /etc/nova/nova.conf
+    fi
+
+    #set the libvirt config file
+    sed -i "s/#LIBVIRTD_ARGS=\"--listen\"/LIBVIRTD_ARGS=\"--listen\"/g" /etc/sysconfig/libvirtd
+    sed -i "s/#listen_tls = 0/listen_tls = 0/g" /etc/libvirt/libvirtd.conf
+    sed -i "s/#listen_tcp = 1/listen_tcp = 1/g" /etc/libvirt/libvirtd.conf
+    sed -i "s/#auth_tcp = \"sasl\"/auth_tcp = \"none\"/g" /etc/libvirt/libvirtd.conf
+
+    UUID=`uuidgen`
+    sed -i "/#host_uuid/a host_uuid = \"$UUID\"" /etc/libvirt/libvirtd.conf
+else
+    echo "Edit the nova config file"
+    echo -e "[database]\nconnection = mysql://nova:$NOVA_DB_PASS@$MARIADB_NODE_IP/nova" >> /etc/nova/nova.conf
+
+    sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+my_ip = $THISHOST_IP\n\
+network_api_class = nova.network.neutronv2.api.API\n\
+security_group_api = neutron\n\
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver\n\
+firewall_driver = nova.virt.firewall.NoopFirewallDriver\n\
+vnc_enabled = True\n\
+vncserver_listen = 0.0.0.0\n\
+vncserver_proxyclient_address = $CONTROLLER_NODE_HOSTNAME\n\
+novncproxy_base_url = http://$CONTROLLER_NODE_HOSTNAME:6080/vnc_auto.html" /etc/nova/nova.conf
+
+    sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = nova\n\
+admin_password = $NOVA_USER_PASS" /etc/nova/nova.conf
+
+    sed -i "/\[spice\]/a \
+html5proxy_base_url = http://$CONTROLLER_NODE_HOSTNAME:6082/spice_auto.html\n\
+server_listen = 0.0.0.0\n\
+server_proxyclient_address = $CONTROLLER_NODE_HOSTNAME\n\
+enabled = true\n\
+agent_enabled = true\n\
+usbredir_channels=4" /etc/nova/nova.conf
+
+    sed -i "/\[glance\]/a host = $CONTROLLER_NODE_HOSTNAME" /etc/nova/nova.conf
+
+    sed -i "/\[neutron\]/a \
+url = http://$CONTROLLER_NODE_HOSTNAME:9696\n\
+auth_strategy = keystone\n\
+admin_auth_url = http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0\n\
+admin_tenant_name = service\n\
+admin_username = neutron\n\
+admin_password = $NEUTRON_USER_PASS\n\
+service_metadata_proxy = True\n\
+metadata_proxy_shared_secret = $META_PWD" /etc/nova/nova.conf
+fi
+
+echo "change default config"
+sed -i "s/#quota_instances=10/quota_instances=1000/g" /etc/nova/nova.conf
+sed -i "s/#quota_cores=20/quota_cores=2000/g" /etc/nova/nova.conf
+sed -i "s/#quota_floating_ips=10/quota_floating_ips=1000/g" /etc/nova/nova.conf
+sed -i "s/#quota_ram=51200/quota_ram=5120000/g" /etc/nova/nova.conf
+sed -i "s/#mounted_disk_query_retry_count=10/mounted_disk_query_retry_count=1000/g" /etc/nova/nova.conf
+
+echo "sync nova database"
+su -s /bin/sh -c "nova-manage db sync" nova
+
+echo "start nova service"
+systemctl enable openstack-nova-api.service openstack-nova-cert.service \
+  openstack-nova-consoleauth.service openstack-nova-scheduler.service \
+  openstack-nova-conductor.service openstack-nova-novncproxy.service \
+  openstack-nova-spicehtml5proxy
+
+systemctl start openstack-nova-api.service
+systemctl status openstack-nova-api.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-api service failed"; exit 1;fi
+
+systemctl start openstack-nova-consoleauth.service
+systemctl status openstack-nova-consoleauth.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-consoleauth service failed"; exit 1;fi
+
+systemctl start openstack-nova-cert.service
+systemctl status openstack-nova-cert.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-cert service failed"; exit 1;fi
+
+systemctl start openstack-nova-scheduler.service
+systemctl status openstack-nova-scheduler.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-scheduler service failed"; exit 1;fi
+
+systemctl start openstack-nova-conductor.service
+systemctl status openstack-nova-conductor.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-conductor service failed"; exit 1;fi
+
+systemctl start openstack-nova-novncproxy.service
+systemctl status openstack-nova-novncproxy.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-novncproxy service failed"; exit 1;fi
+
+systemctl start openstack-nova-spicehtml5proxy
+systemctl status openstack-nova-spicehtml5proxy
+if [ $? -gt 0 ]; then send-service-report "$HostName:nova:failed:start openstack-nova-spicehtml5proxy service failed"; exit 1;fi
+
+#####################################
+#Start openstack-nova-compute service 
+if [ $# -gt 0 -a "$1" == "allinone" ];then
+    echo "Start openstack-nova-compute service"
+    systemctl enable libvirtd.service openstack-nova-compute.service
+    systemctl start libvirtd.service
+    systemctl status libvirtd.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-gre:failed:start libvirtd service failed"; exit 1;fi
+
+    systemctl start openstack-nova-compute.service
+    systemctl status openstack-nova-compute.service
+    if [ $? -gt 0 ]; then send-service-report "$HostName:nova-compute-gre:failed:start openstack-nova-compute service failed"; exit 1;fi
+fi
+####################################
+
+
+send-service-report "$HostName:nova:success"

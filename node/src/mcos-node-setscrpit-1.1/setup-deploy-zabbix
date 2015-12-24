@@ -1,0 +1,69 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install zabbix"
+rpm -q php-mysql &> /dev/null || yum install php-mysql php-gd php-xml php-bcmath -y
+rpm -q zabbix-get &> /dev/null || yum install zabbix-get zabbix-server-mysql zabbix-web-mysql zabbix-agent trousers -y
+
+/usr/local/bin/clear-zabbix
+
+#create database
+echo 'Create the database'
+if [ "$HostName" == "$MARIADB_NODE_HOSTNAME" -a "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+create database zabbix;
+grant all privileges on zabbix.* to zabbix@'localhost' identified by '$ZABBIX_DB_PASSWD';
+grant all privileges on zabbix.* to zabbix@'%' identified by '$ZABBIX_DB_PASSWD';
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+create database zabbix;
+grant all privileges on zabbix.* to zabbix@'localhost' identified by '$ZABBIX_DB_PASSWD';
+grant all privileges on zabbix.* to zabbix@'%' identified by '$ZABBIX_DB_PASSWD';
+EOF
+fi
+
+CURRENT_DIR=`pwd`
+#cd /usr/share/doc/zabbix-server-mysql-2.4.6/create
+if [ "$HostName" == "$MARIADB_NODE_HOSTNAME" -a "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+use zabbix;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/schema.sql;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/images.sql;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/data.sql;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+use zabbix;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/schema.sql;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/images.sql;
+source /usr/share/doc/zabbix-server-mysql-2.4.6/create/data.sql;
+EOF
+fi    
+
+sed -i "s/# DBHost=localhost/DBHost=$MARIADB_NODE_IP/g" /etc/zabbix/zabbix_server.conf
+sed -i "s/# DBPassword=.*/DBPassword=$ZABBIX_DB_PASSWD/g" /etc/zabbix/zabbix_server.conf
+echo "StartVMwareCollectors=2" >> /etc/zabbix/zabbix_server.conf
+
+systemctl enable zabbix-server 
+systemctl start zabbix-server
+systemctl status zabbix-server
+
+sed -i "/Require all granted/a \    Require ip 127.0.0.1 $MANAGE_NETWORK_SEGMENT" /etc/httpd/conf.d/zabbix.conf
+sed -i "/php_value max_input_time 300/a  \    php_value date.timezone Asia/Shanghai" /etc/httpd/conf.d/zabbix.conf
+systemctl restart httpd 
+systemctl status httpd 
+
+

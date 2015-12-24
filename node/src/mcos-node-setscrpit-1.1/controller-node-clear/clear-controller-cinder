@@ -1,0 +1,52 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+
+HostName=`hostname`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+#Stop all service
+echo "Stop Cinder Service"
+systemctl status openstack-cinder-api.service &> /dev/null && systemctl stop openstack-cinder-api.service 
+systemctl status openstack-cinder-scheduler.service &> /dev/null && systemctl stop openstack-cinder-scheduler.service
+
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+DROP DATABASE cinder;
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+DROP DATABASE cinder;
+FLUSH PRIVILEGES;
+EOF
+fi
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_CINDER_CONFIG_DIR=/etc/openstack/service/cinder
+#Reset All Config File
+echo "Reset all config file"
+if [ -d "$OPENSTACK_CINDER_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_CINDER_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/cinder $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

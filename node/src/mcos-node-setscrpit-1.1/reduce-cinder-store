@@ -1,0 +1,31 @@
+#!/bin/bash
+
+if [ $# -gt 0 ];then
+    for disk in $@; do
+        echo "$disk";
+        ALLOCATABLE=`pvdisplay /dev/sdb | grep 'Allocatable' | awk '{print $2}'`
+        TOTAL_PE=`pvdisplay /dev/sdb | grep 'Total PE' | awk '{print $3}'`
+        FREE_PE=`pvdisplay /dev/sdb | grep 'Free PE' | awk '{print $3}'`
+
+        if [ "$ALLOCATABLE" == "NO" ];then
+            if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:reduce $disk failed, ALLOCATABLE is NO"; exit 1;fi
+        fi
+
+        if [ "$TOTAL_PE" == "0" -o "FREE_PE" == "0" ]; then 
+            if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:Disk $disk has create logical volume"; exit 1;fi
+        fi
+
+        if [ "$TOTAL_PE" != "$FREE_PE" ]; then
+            if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:Disk $disk has used"; exit 1;fi
+        fi
+        
+        vgreduce cinder-volumes $disk;
+        if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:user $disk reduce from cinder-volumes failed"; exit 1;fi
+        pvremove $disk;
+        if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:remove $disk from physical volume failed"; exit 1;fi
+    done
+else
+    exit 1;
+fi
+
+send-service-report "$HostName:cinder-volume:success"

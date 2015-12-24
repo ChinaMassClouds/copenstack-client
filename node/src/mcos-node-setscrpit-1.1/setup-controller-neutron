@@ -1,0 +1,172 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+rpm -q openstack-neutron &> /dev/null || yum install openstack-neutron openstack-neutron-ml2 python-neutronclient openstack-neutron-openvswitch -y
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration neutron service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the neutron service"
+/usr/local/bin/controller-node-clear/clear-controller-neutron
+
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$NEUTRON_DB_PASS';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$NEUTRON_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$NEUTRON_DB_PASS';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$NEUTRON_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron database failed"; exit 1;fi
+
+echo "Create keystone entries for neutron"
+keystone user-list | grep neutron &> /dev/null && keystone user-delete neutron
+for ID in `keystone service-list | grep neutron | awk '{print $2}'`;do keystone service-delete $ID; done
+
+keystone user-create --name neutron --pass $NEUTRON_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron user failed"; exit 1;fi
+
+keystone user-role-add --user neutron --tenant service --role admin
+keystone service-create --name neutron --type network \
+  --description "OpenStack Networking"
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron service failed"; exit 1;fi
+
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ network / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:9696 \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:create neutron endpoint failed"; exit 1;fi
+
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.conf  
+echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf  
+echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+
+sysctl -p  
+
+echo "Edit the config file"
+sed -i "/\[database\]/a \
+connection = mysql://neutron:$NEUTRON_DB_PASS@$MARIADB_NODE_IP/neutron" /etc/neutron/neutron.conf
+
+SERVICE_TENANT_ID=$(keystone tenant-list | awk '/ service / {print $2}')
+
+sed -i "/^\[DEFAULT\]$/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+core_plugin = ml2\n\
+service_plugins = router\n\
+allow_overlapping_ips = True\n\
+notify_nova_on_port_status_changes = True\n\
+notify_nova_on_port_data_changes = True\n\
+nova_url = http:\/\/$CONTROLLER_NODE_HOSTNAME:8774\/v2\n\
+nova_admin_auth_url = http:\/\/$CONTROLLER_NODE_HOSTNAME:35357\/v2.0\n\
+nova_region_name = regionOne\n\
+nova_admin_username = nova\n\
+nova_admin_tenant_id = $SERVICE_TENANT_ID\n\
+nova_admin_password = $NOVA_USER_PASS" /etc/neutron/neutron.conf
+
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/neutron/neutron.conf
+
+if [ $NETWORK_TYPE == 'gre' ]; then
+    #edit /etc/neutron/plugins/ml2/ml2_conf.ini
+    sed -i "/\[ml2\]/a \
+type_drivers = gre\n\
+tenant_network_types = gre\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_gre\]/a \
+tunnel_id_ranges = 1:1000" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    #sed -i "/\[ml2_type_flat\]/a \
+     #  flat_networks = external" /etc/neutron/plugins/ml2/ml2_conf.ini
+elif [ $NETWORK_TYPE == 'vlan' ]; then
+    sed -i "/\[ml2\]/a \
+type_drivers = vlan\n\
+tenant_network_types = vlan\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_vlan\]/a \
+network_vlan_ranges = physnet2:$VLAN_ID_BEGIN_VALUE:$VLAN_ID_END_VALUE" /etc/neutron/plugins/ml2/ml2_conf.ini
+elif [ $NETWORK_TYPE == 'vxlan' ]; then
+    sed -i "/\[ml2\]/a \
+type_drivers = vxlan\n\
+tenant_network_types = vxlan\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_vxlan\]/a \
+vni_ranges = $VXLAN_ID_BEGIN_VALUE:$VXLAN_ID_END_VALUE" /etc/neutron/plugins/ml2/ml2_conf.ini 
+fi
+
+sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver" \
+/etc/neutron/plugins/ml2/ml2_conf.ini
+
+rm -rf /etc/neutron/plugin.ini
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+su -s /bin/sh -c "neutron-db-manage --config-file /etc/neutron/neutron.conf --config-file /etc/neutron/plugins/ml2/ml2_conf.ini upgrade juno" neutron
+
+systemctl restart openstack-nova-api.service
+systemctl status openstack-nova-api.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-api service failed"; exit 1;fi
+
+systemctl restart openstack-nova-scheduler.service
+systemctl status openstack-nova-scheduler.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-scheduler service failed"; exit 1;fi
+
+systemctl restart openstack-nova-conductor.service
+systemctl status openstack-nova-conductor.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start openstack-nova-conductor service failed"; exit 1;fi
+
+systemctl enable neutron-server.service
+systemctl start neutron-server.service
+systemctl status neutron-server.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:neutron:failed:start neutron-server service failed"; exit 1;fi
+
+send-service-report "$HostName:neutron:success"
+
+

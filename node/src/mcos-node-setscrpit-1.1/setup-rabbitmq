@@ -1,0 +1,68 @@
+#!/usr/bin/sh
+
+HostName=`hostname`
+
+NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$IP       //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration  rabbitmq   //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+#关闭防火墙
+echo "stop and disable firewalld"
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+echo "disable selinux"
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+
+#安装rabbitmq服务
+echo "install the rabbitmq server rpm"
+rpm -q rabbitmq-server &> /dev/null || yum -y install rabbitmq-server
+
+#设置rabbitmq服务开机自启并启动
+echo "enable the mariadb service"
+systemctl enable rabbitmq-server.service
+systemctl start  rabbitmq-server.service
+
+#创建新用户
+echo "add the admin user"
+rabbitmqctl add_user admin admin
+
+#为用户赋予adninistrator角色
+echo "give the adninistrator role to the admin user"
+rabbitmqctl set_user_tags admin administrator
+
+#为用户添加读写权限
+echo "give the authority to the admin user"
+rabbitmqctl set_permissions -p / admin ".*" ".*" ".*"
+
+#创建配置文件
+echo "touch the config file /etc/rabbitmq/rabbitmq.config"
+touch /etc/rabbitmq/rabbitmq.config
+chmod 777 /etc/rabbitmq/rabbitmq.config
+
+#修改配置文件
+echo "modify the config file /etc/rabbitmq/rabbitmq.config"
+echo '[{rabbit, [{tcp_listeners, [5672]}, {loopback_users, ["admin"]}]}].' > /etc/rabbitmq/rabbitmq.config
+
+#重新启动服务
+echo "restart the rabbitmq server"
+systemctl restart  rabbitmq-server.service
+systemctl status   rabbitmq-server.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:rabbitmq:failed:start rabbitmq-server service failed"; exit 1;fi
+
+send-service-report "$HostName:rabbitmq:success"
+

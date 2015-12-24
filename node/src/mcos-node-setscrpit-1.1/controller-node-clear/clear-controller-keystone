@@ -1,0 +1,44 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+HostName=`hostname`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+#Stop all service
+echo "Stop All Service"
+echo "Stop ntp service"
+systemctl stop ntpd.service
+
+echo "Stop openstack-keystone service"
+systemctl status openstack-keystone.service &> /dev/null && systemctl stop openstack-keystone.service
+
+
+#Delete keystone databases
+echo "Delete keystone databases"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+DROP DATABASE keystone;
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+DROP DATABASE keystone;
+FLUSH PRIVILEGES;
+EOF
+fi
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_KEYSTONE_CONFIG_DIR=/etc/openstack/service/keystone
+#Reset Keystone Config File
+echo "Reset Keystone config file"
+if [ -d "$OPENSTACK_KEYSTONE_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_KEYSTONE_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/keystone $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+
+
+

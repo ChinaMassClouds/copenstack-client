@@ -1,0 +1,69 @@
+#!/usr/bin/sh
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+source /root/creds
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$IP       //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration  mongodb   // //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+#关闭防火墙
+echo "stop and disable firewalld"
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+echo "disable selinux"
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+setenforce 0
+
+#安装数据库服务
+echo "install the database mongodb"
+rpm -q mongodb-server &> /dev/null || yum -y install mongodb-server mongodb
+systemctl status mongod.service &> /dev/null && systemctl stop mongod.service
+
+
+#设置数据库配置文件
+echo "set the config file /etc/mongodb.conf"
+sed -i "s/bind_ip = 127.0.0.1/bind_ip = $MONGODB_DATABASE_IP/g" /etc/mongod.conf
+sed -i "s/bind_ip = 127.0.0.1/bind_ip = $MONGODB_DATABASE_IP/g" /etc/mongos.conf
+sed -i "s/#smallfiles = true/smallfiles = true/g" /etc/mongod.conf
+
+#设置数据库开机自启并启动
+echo "enable the mongodb service"
+systemctl enable mongod.service  
+systemctl start mongod.service
+systemctl status mongod.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:mongod:failed:start mongod service failed"; exit 1;fi
+
+mongo --host $MONGODB_DATABASE_IP --eval 'db = db.getSiblingDB("ceilometer");db.dropDatabase()'
+
+mongo --host $MONGODB_DATABASE_IP --eval 'db = db.getSiblingDB("ceilometer");db.dropUser("ceilometer")'
+
+mongo --host $MONGODB_DATABASE_IP --eval '  
+db = db.getSiblingDB("ceilometer");  
+db.createUser({user: "ceilometer",  
+pwd: "ceilometerDB",  
+roles: [ "readWrite", "dbAdmin" ]})'
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:mongod:failed:create ceilometer database failed"; exit 1;fi
+
+crontab -r
+echo "30     23       *           *     *     mongodb_clear" >> /var/spool/cron/root
+crontab -l
+
+send-service-report "$HostName:mongodb:success"
+

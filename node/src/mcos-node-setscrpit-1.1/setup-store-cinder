@@ -1,0 +1,102 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP //////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration  cinder   ////////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install ntp"
+rpm -q ntp &> /dev/null || yum install ntp -y
+
+ntpdate $CONTROLLER_NODE_IP
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration cinder volume service   //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install cinder service"
+rpm -q lvm2 &> /dev/null || yum install lvm2 -y
+rpm -q openstack-cinder &> /dev/null || yum install openstack-cinder -y
+rpm -q targetcli &> /dev/null || yum install targetcli -y
+rpm -q python-oslo-db &> /dev/null || yum install python-oslo-db -y
+rpm -q MySQL-python &> /dev/null || yum install MySQL-python -y
+
+if [ $# -gt 0 ];then
+    for disk in $@; do
+        echo "$disk";
+        pvcreate $disk -y;
+        vgdisplay cinder-volumes &> /dev/null
+        if [ $? -gt 0 ]; then
+            vgcreate cinder-volumes $disk;
+            if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:use $disk create volume group cinder-volumes failed"; exit 1;fi
+        else
+            vgextend cinder-volumes $disk;
+            if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:use $disk extend volume gropu cinder-volumes failed"; exit 1;fi
+        fi
+    done
+fi
+
+echo "Edit the cinder config file"
+sed -i "/\[database\]/a \
+connection = mysql://cinder:$CINDER_DB_PASS@$MARIADB_NODE_IP/cinder" /etc/cinder/cinder.conf
+
+sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+glance_host = $CONTROLLER_NODE_HOSTNAME\n\
+iscsi_helper = lioadm\n\
+my_ip = $THISHOST_IP" /etc/cinder/cinder.conf
+
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = cinder\n\
+admin_password = $CINDER_USER_PASS" /etc/cinder/cinder.conf
+
+systemctl enable lvm2-lvmetad.service
+systemctl start lvm2-lvmetad.service
+
+systemctl enable openstack-cinder-volume.service target.service
+
+systemctl start openstack-cinder-volume.service 
+systemctl status openstack-cinder-volume.service 
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:start openstack-cinder-volume service failed"; exit 1;fi
+
+systemctl start target.service
+systemctl status target.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:cinder-volume:failed:start target service failed"; exit 1;fi
+
+send-service-report "$HostName:cinder-volume:success"
+

@@ -1,0 +1,14 @@
+#!/bin/bash
+
+case "$1" in
+    start)
+        python /usr/share/client_node_info/nodeInfoUdp.py start &
+        ;;
+    stop)
+        python /usr/share/client_node_info/nodeInfoUdp.py stop
+        ;;
+    restart)
+        python /usr/share/client_node_info/nodeInfoUdp.py stop
+        python /usr/share/client_node_info/nodeInfoUdp.py start &
+        ;;
+esac

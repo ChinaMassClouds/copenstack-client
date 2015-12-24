@@ -1,0 +1,54 @@
+#!/bin/bash
+
+
+#检测ceph-deploy的rpm包是否安装
+rpm -q ceph-deploy &> /dev/null || sudo yum install ceph-deploy -y
+
+
+echo "delete ssh key"
+#删除ssh-key文件
+rm -rf /root/.ssh/id_rsa*
+rm -rf /home/ceph/.ssh/id_rsa*
+
+
+echo "ssh key create"
+#产生ssh-key
+ssh-keygen -t rsa -N '' -f /root/.ssh/id_rsa
+runuser ceph -s /bin/bash -c "ssh-keygen -t rsa -N '' -f /home/ceph/.ssh/id_rsa"
+
+
+#将部署节点的key，ssh-copy-id复制到各个节点
+ALL_HOST_NAME=`cat /etc/hosts | awk  -F ' '  '{print $2}' | grep -v 'localhost' | grep -v 'master.server.com'`
+CEPH_CLUSTER_HOST_NAME=""
+for hostname in $ALL_HOST_NAME;do
+    if [ "${hostname:0:4}" == "ceph" ];then
+        CEPH_CLUSTER_HOST_NAME+="$hostname "
+    fi
+done
+
+for hostname in $ALL_HOST_NAME;do
+    runuser ceph -s /bin/bash -c "ssh-copy-ceph-id $hostname ceph"
+done
+
+for hostname in $ALL_HOST_NAME; do ssh-copy-ceph-id $hostname root; done
+
+#将ceph集群中的节点的配置擦除
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    echo $cephhostname;
+    runuser ceph -s /bin/bash -c "ceph-deploy purge $cephhostname"
+    runuser ceph -s /bin/bash -c "ceph-deploy purgedata $cephhostname"
+    runuser ceph -s /bin/bash -c "ceph-deploy forgetkeys"
+done
+
+
+#在各个节点上安装ceph包
+for cephhostname in $CEPH_CLUSTER_HOST_NAME; do
+    ssh $cephhostname yum install ceph ceph-radosgw -y
+done
+
+#执行ceph的配置
+runuser ceph -s /bin/bash -c "/usr/local/bin/setup-ceph"
+
+
+
+

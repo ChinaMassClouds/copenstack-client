@@ -1,0 +1,306 @@
+#!/bin/bash
+
+#get the config file
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////////////////    configuration compute node ////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+yum install qemu-kvm libvirt openstack-nova-compute sysfsutils -y
+yum install spice-html5 openstack-nova-spicehtml5proxy -y
+yum install sysfsutils -y
+yum install openstack-neutron-ml2 openstack-neutron-openvswitch -y
+
+
+echo "yum install ntp"
+yum install ntp -y
+
+ntpdate $CONTROLLER_NODE_IP
+
+echo "clear the config"
+/usr/local/bin/compute-node-clear/clear-compute-node
+
+#stop firewall service
+echo "Stop firewall service"
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+#close selinux
+sed -i 's/enforcing/disabled/g' /etc/selinux/config
+echo 0 > /sys/fs/selinux/enforce
+
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration nova service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+echo "Edit the nova config file"
+
+
+sed -i "/\[DEFAULT\]/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+auth_strategy = keystone\n\
+my_ip = $THISHOST_IP\n\
+instance_usage_audit = True\n\
+instance_usage_audit_period = hour\n\
+notify_on_state_change = vm_and_task_state\n\
+notification_driver = nova.openstack.common.notifier.rpc_notifier\n\
+notification_driver = ceilometer.compute.nova_notifier\n\
+vif_plugging_timeout = 10\n\
+vif_plugging_is_fatal = False\n\
+instances_path = /home/openstack_data/nova/instances\n\
+vnc_enabled = True\n\
+verbose = True\n\
+vncserver_listen = 0.0.0.0\n\
+vncserver_proxyclient_address = $THISHOST_IP\n\
+novncproxy_base_url = http://$CONTROLLER_NODE_HOSTNAME:6080/vnc_auto.html\n\
+network_api_class = nova.network.neutronv2.api.API\n\
+security_group_api = neutron\n\
+linuxnet_interface_driver = nova.network.linux_net.LinuxOVSInterfaceDriver\n\
+firewall_driver = nova.virt.firewall.NoopFirewallDriver" /etc/nova/nova.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = nova\n\
+admin_password = $NOVA_USER_PASS" /etc/nova/nova.conf
+
+sed -i "/\[spice\]/a \
+html5proxy_base_url = http://$THISHOST_IP:6082/spice_auto.html\n\
+server_listen = 0.0.0.0\n\
+server_proxyclient_address = $THISHOST_IP\n\
+enabled = true\n\
+agent_enabled = true\n\
+usbredir_channels=4" /etc/nova/nova.conf
+
+sed -i "/\[glance\]/a host = $CONTROLLER_NODE_HOSTNAME" /etc/nova/nova.conf
+
+echo "add custom support spice file"
+cp -rf /usr/local/include/massclouds_console.py /usr/lib/python2.7/site-packages/nova/api/openstack/compute/contrib/
+
+#if compute node is virtual - change virt_type to qemu
+if [ $(egrep -c '(vmx|svm)' /proc/cpuinfo) == "0" ]; then
+    sed -i '/\[libvirt\]/a virt_type = qemu' /etc/nova/nova.conf
+fi
+
+#set ceilometer monitor vm memory usage
+sed -i '/\[libvirt\]/a mem_stats_period_seconds=10' /etc/nova/nova.conf
+
+#set the libvirt config file
+sed -i "s/#LIBVIRTD_ARGS=\"--listen\"/LIBVIRTD_ARGS=\"--listen\"/g" /etc/sysconfig/libvirtd
+sed -i "s/#listen_tls = 0/listen_tls = 0/g" /etc/libvirt/libvirtd.conf
+sed -i "s/#listen_tcp = 1/listen_tcp = 1/g" /etc/libvirt/libvirtd.conf
+sed -i "s/#auth_tcp = \"sasl\"/auth_tcp = \"none\"/g" /etc/libvirt/libvirtd.conf
+
+UUID=`uuidgen`
+sed -i "/#host_uuid/a host_uuid = \"$UUID\"" /etc/libvirt/libvirtd.conf
+
+#host_uuid = "00000000-0000-0000-0000-000000000000"
+
+NOVA_INSTANCE_PATH=/home/openstack_data/nova/instances
+if [ ! -d $NOVA_INSTANCE_PATH ]; then
+    mkdir -pv $NOVA_INSTANCE_PATH;
+    cp -a /var/lib/nova /home/openstack_data/
+    chown -R nova:nova /home/openstack_data/nova
+fi
+
+#Start openstack-nova-compute service 
+echo "Start openstack-nova-compute service"
+systemctl enable libvirtd.service openstack-nova-compute.service  
+systemctl start libvirtd.service openstack-nova-compute.service  
+systemctl status libvirtd.service openstack-nova-compute.service
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration neutron service   ///////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+
+#config ipv4 
+echo "net.ipv4.ip_forward=1" > /etc/sysctl.conf
+echo "net.ipv4.conf.all.rp_filter=0" >> /etc/sysctl.conf
+echo "net.ipv4.conf.default.rp_filter=0" >> /etc/sysctl.conf
+
+sysctl -p
+
+sed -i "/\[DEFAULT\]/a \
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_HOSTNAME\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+verbose = True\n\
+auth_strategy = keystone\n\
+core_plugin = ml2\n\
+service_plugins = router\n\
+allow_overlapping_ips = True" /etc/neutron/neutron.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/neutron/neutron.conf
+
+if [ "$MANAGE_DATA_NET_INONE" == "true" ]; then     
+    NETWORK_NODE_TUNNEL_IP=$THISHOST_IP
+fi
+
+if [ $NETWORK_TYPE == 'gre' ]; then
+    #edit /etc/neutron/plugins/ml2/ml2_conf.ini
+    sed -i "/\[ml2\]/a \
+type_drivers = flat,gre\n\
+tenant_network_types = gre\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_gre\]/a \
+tunnel_id_ranges = 1:1000" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver\n\
+[ovs]\n\
+local_ip = $NETWORK_NODE_TUNNEL_IP\n\
+enable_tunneling = True\n\
+[agent]\n\
+tunnel_types = gre" /etc/neutron/plugins/ml2/ml2_conf.ini
+elif [ $NETWORK_TYPE == 'vlan' ]; then
+    sed -i "/\[ml2\]/a \
+type_drivers = flat,vlan\n\
+tenant_network_types = vlan\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_vlan\]/a \
+network_vlan_ranges = physnet2:$VLAN_ID_BEGIN_VALUE:$VLAN_ID_END_VALUE" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver\n\
+[ovs]\n\
+local_ip = $NETWORK_NODE_TUNNEL_IP\n\
+tenant_network_type = vlan\n\
+integration_bridge = br-int\n\
+network_vlan_ranges = physnet2:$VLAN_ID_BEGIN_VALUE:$VLAN_ID_END_VALUE\n\
+bridge_mappings = physnet2:br-eth1" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    echo "get NIC info"
+    INT_INTERFACE_ETH1_INDEX=3
+
+    echo "INT_INTERFACE_ETH1_INDEX:$INT_INTERFACE_ETH1_INDEX"
+    for i in $(ls /sys/class/net); do
+        if [ "$(cat /sys/class/net/$i/ifindex)" == "$INT_INTERFACE_ETH1_INDEX" ]; then
+            NIC_ETH1=$i
+        fi
+    done
+
+    echo "The NIC is: $NIC_ETH1"
+    systemctl enable openvswitch.service
+    systemctl start openvswitch.service
+    ovs-vsctl add-br br-int
+    ovs-vsctl add-br br-eth1
+    ovs-vsctl add-port br-eth1 $NIC_ETH1
+    
+elif [ $NETWORK_TYPE == 'vxlan' ]; then
+    sed -i "/\[ml2\]/a \
+type_drivers = flat,vxlan\n\
+tenant_network_types = vxlan\n\
+mechanism_drivers = openvswitch" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[ml2_type_vxlan\]/a \
+vni_ranges = $VXLAN_ID_BEGIN_VALUE:$VXLAN_ID_END_VALUE" /etc/neutron/plugins/ml2/ml2_conf.ini
+
+    sed -i "/\[securitygroup\]/a \
+enable_security_group = True\n\
+enable_ipset = True\n\
+firewall_driver = neutron.agent.linux.iptables_firewall.OVSHybridIptablesFirewallDriver\n\
+[ovs]\n\
+local_ip = $NETWORK_NODE_TUNNEL_IP\n\
+enable_tunneling = True\n\
+bridge_mappings = external:br-ex\n\
+[agent]\n\
+tunnel_types = vxlan" /etc/neutron/plugins/ml2/ml2_conf.ini
+fi
+
+sed -i "/\[DEFAULT\]/a \
+interface_driver = neutron.agent.linux.interface.OVSInterfaceDriver\n\
+dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq\n\
+use_namespaces = True\n\
+verbose = True\n\
+dhcp_delete_namespaces = True" /etc/neutron/dhcp_agent.ini
+
+
+
+echo "Start openvswitch service"
+systemctl enable openvswitch.service
+systemctl start openvswitch.service
+
+echo "Edit nova config file"
+
+
+sed -i "/\[neutron\]/a \
+url = http://$CONTROLLER_NODE_HOSTNAME:9696\n\
+auth_strategy = keystone\n\
+admin_auth_url = http://$CONTROLLER_NODE_HOSTNAME:35357/v2.0\n\
+admin_tenant_name = service\n\
+admin_username = neutron\n\
+admin_password = $NEUTRON_USER_PASS" /etc/nova/nova.conf
+
+#restart openstack-nova-compute service 
+echo "Start openstack-nova-compute service"
+systemctl restart openstack-nova-compute.service
+systemctl status openstack-nova-compute.service
+
+rm -rf /etc/neutron/plugin.ini
+ln -s /etc/neutron/plugins/ml2/ml2_conf.ini /etc/neutron/plugin.ini
+
+cp /usr/lib/systemd/system/neutron-openvswitch-agent.service \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service.orig
+sed -i 's,plugins/openvswitch/ovs_neutron_plugin.ini,plugin.ini,g' \
+  /usr/lib/systemd/system/neutron-openvswitch-agent.service
+
+echo "Start neutron-openvswitch-agent service"
+systemctl enable neutron-openvswitch-agent.service
+systemctl start neutron-openvswitch-agent.service
+systemctl status neutron-openvswitch-agent.service
+
+
+echo "Start neutron-dhcp-agent servcie"
+systemctl enable neutron-dhcp-agent.service
+systemctl start neutron-dhcp-agent.service
+systemctl status neutron-dhcp-agent.service
+
+echo "Finish the compute node config"
+
+
+
+
+
+
+
+
+
+

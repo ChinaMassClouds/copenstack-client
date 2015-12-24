@@ -1,0 +1,23 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+setup-controller-keystone
+
+if [ "$GLANCE_STORE_TYPE" == "localfile" ]; then   
+    setup-controller-glance
+fi
+
+setup-controller-nova
+
+setup-controller-neutron
+
+setup-controller-cinder
+
+setup-controller-heat
+
+setup-controller-ceilometer
+
+setup-controller-horizon
+

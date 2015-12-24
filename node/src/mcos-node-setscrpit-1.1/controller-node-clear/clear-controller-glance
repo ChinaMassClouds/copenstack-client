@@ -1,0 +1,40 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+HostName=`hostname`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+#Stop all service
+echo "Stop All Service"
+
+echo "Stop openstack-glance service"
+systemctl status openstack-glance-api.service &> /dev/null && systemctl stop openstack-glance-api.service 
+systemctl status openstack-glance-registry.servic &> /dev/null && systemctl stop openstack-glance-registry.service
+
+#Delete glance databases
+echo "Delete glance databases"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+DROP DATABASE glance;
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+DROP DATABASE glance;
+FLUSH PRIVILEGES;
+EOF
+fi
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_GLANCE_CONFIG_DIR=/etc/openstack/service/glance
+#Reset Glance Config File
+echo "Reset glance config file"
+if [ -d "$OPENSTACK_GLANCE_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_GLANCE_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/glance $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+

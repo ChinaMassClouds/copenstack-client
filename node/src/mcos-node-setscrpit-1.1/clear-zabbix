@@ -1,0 +1,30 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+
+echo "Stop openstack compute service"
+systemctl status zabbix-server &> /dev/null && systemctl stop zabbix-server
+
+if [ "$HostName" == "$MARIADB_NODE_HOSTNAME" -a "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+drop database zabbix;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+drop database zabbix;
+EOF
+fi
+
+ZABBIX_SERVICE_CONFIG_DIR=/etc/zabbix-bak/
+OPENSTACK_NOVA_CONFIG_DIR=/etc/zabbix-bak/zabbix_server.conf
+OPENSTACK_NEUTRON_CONFIG_DIR=/etc/zabbix-bak/
+#Reset Zabbix Config File
+echo "Reset config file"
+if [ -d "$ZABBIX_SERVICE_CONFIG_DIR" ]; then
+    cp -rf $ZABBIX_SERVICE_CONFIG_DIR /etc/zabbix/zabbix_server.conf ;
+    cp -rf $ZABBIX_SERVICE_CONFIG_DIR /etc/httpd/conf.d/zabbix.conf ;
+else
+    mkdir -pv $ZABBIX_SERVICE_CONFIG_DIR;
+    cp -rf /etc/zabbix/zabbix_server.conf $ZABBIX_SERVICE_CONFIG_DIR;
+    cp -rf /etc/httpd/conf.d/zabbix.conf $ZABBIX_SERVICE_CONFIG_DIR;
+fi

@@ -1,0 +1,6 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+
+python /usr/local/share/mongodb/mongodb_clear.py $MONGODB_DATABASE_IP
+

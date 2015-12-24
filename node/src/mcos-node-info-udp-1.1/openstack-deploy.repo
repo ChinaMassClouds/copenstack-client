@@ -1,0 +1,5 @@
+[openstack-noarch]
+name=Openstack packages
+baseurl=http://master.server.com/openstackrpmrepo
+enabled=1
+gpgcheck=0

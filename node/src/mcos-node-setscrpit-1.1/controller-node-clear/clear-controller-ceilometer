@@ -1,0 +1,45 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+
+#Stop all service
+echo "Stop All Service"
+
+systemctl status openstack-ceilometer-api.service &> /dev/null && systemctl stop openstack-ceilometer-api.service 
+systemctl status openstack-ceilometer-notification.service &> /dev/null && systemctl stop openstack-ceilometer-notification.service
+systemctl status openstack-ceilometer-central.service &> /dev/null && systemctl stop openstack-ceilometer-central.service 
+systemctl status openstack-ceilometer-collector.service &> /dev/null && systemctl stop openstack-ceilometer-collector.service
+systemctl status openstack-ceilometer-alarm-evaluator.servic &> /dev/null && systemctl stop openstack-ceilometer-alarm-evaluator.service
+systemctl status openstack-ceilometer-alarm-notifier.service &> /dev/null && systemctl stop openstack-ceilometer-alarm-notifier.service
+
+systemctl status openstack-ceilometer-compute.service &> /dev/null && systemctl stop openstack-ceilometer-compute.service
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_CEILOMETER_CONFIG_DIR=/etc/openstack/service/ceilometer
+#Reset Ceilometer Config File
+echo "Reset Ceilometer config file"
+if [ -d "$OPENSTACK_CEILOMETER_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_CEILOMETER_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/ceilometer $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

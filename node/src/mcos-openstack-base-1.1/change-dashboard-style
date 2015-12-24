@@ -1,0 +1,16 @@
+#!/bin/bash
+
+DASHBOARD_STYLE_CSS_DIR=/usr/share/openstack-dashboard/static/dashboard/css
+
+if [ -d $DASHBOARD_STYLE_CSS_DIR ]; then
+    for subFile in `ls $DASHBOARD_STYLE_CSS_DIR`; do
+        if [ "$subFile" != "font-awesome.min.css" -a "$subFile" != "rickshaw.css" ]; then
+            grep "RCUEIcons-webfont" $DASHBOARD_STYLE_CSS_DIR/$subFile &> /dev/null
+            if [ $? -ne 0 ]; then
+                echo "find the file $subFile"
+                cp /usr/local/include/dashboard.css $DASHBOARD_STYLE_CSS_DIR/$subFile
+            fi
+        fi
+    done
+fi
+

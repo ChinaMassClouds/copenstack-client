@@ -1,0 +1,61 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "yum install nfs service"
+rpm -q nfs-utils &> /dev/null || yum install nfs-utils portmap -y
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration nfs service   //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+groupadd nova
+groupadd glance
+
+useradd -g nova nova
+useradd -g glance glance
+
+mkdir -pv /var/lib/glance/nfs/images
+chown -R glance:glance /var/lib/glance/nfs/images
+
+mkdir -pv /home/openstack_data/nova/instances/
+chown -R nova:nova /home/openstack_data/nova
+
+echo "" > /etc/exports
+echo "/home/openstack_data/nova/instances/ $MANAGE_NETWORK_SEGMENT(rw,no_root_squash,no_all_squash,sync)" >> /etc/exports
+echo "/var/lib/glance/nfs/images/ $MANAGE_NETWORK_SEGMENT(rw,no_root_squash,no_all_squash,sync)" >> /etc/exports
+
+exportfs -r
+
+systemctl enable rpcbind 
+systemctl start rpcbind 
+systemctl status rpcbind 
+if [ $? -gt 0 ]; then send-service-report "$HostName:nfs:failed:start rpcbind service failed"; exit 1;fi
+
+systemctl enable nfs-server
+systemctl start nfs-server
+systemctl status nfs-server
+if [ $? -gt 0 ]; then send-service-report "$HostName:nfs:failed:start nfs-server service failed"; exit 1;fi
+
+send-service-report "$HostName:nfs:success"

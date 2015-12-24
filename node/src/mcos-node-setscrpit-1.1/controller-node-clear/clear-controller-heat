@@ -1,0 +1,39 @@
+#!/bin/bash
+
+source /etc/openstack.cfg
+HostName=`hostname`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+#Stop all service
+echo "Stop Heat Service"
+systemctl status openstack-heat-api.service &> /dev/null && systemctl stop openstack-heat-api.service
+systemctl status openstack-heat-api-cfn.service &> /dev/null && systemctl stop openstack-heat-api-cfn.service
+systemctl status openstack-heat-engine.service &> /dev/null && systemctl stop openstack-heat-engine.service 
+
+#Delete heat databases
+echo "Delete heat databases"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+DROP DATABASE heat;
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+DROP DATABASE heat;
+FLUSH PRIVILEGES;
+EOF
+fi
+
+OPENSTACK_SERVICE_CONFIG_DIR=/etc/openstack/service
+OPENSTACK_HEAT_CONFIG_DIR=/etc/openstack/service/heat
+#Reset Glance Config File
+echo "Reset glance config file"
+if [ -d "$OPENSTACK_HEAT_CONFIG_DIR" ]; then
+    cp -rf $OPENSTACK_HEAT_CONFIG_DIR /etc/ ;
+else
+    mkdir -pv $OPENSTACK_SERVICE_CONFIG_DIR;
+    cp -rf /etc/heat $OPENSTACK_SERVICE_CONFIG_DIR;
+fi
+
+
+

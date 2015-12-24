@@ -1,0 +1,116 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration dashboard service   /////////////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the cinder service"
+/usr/local/bin/controller-node-clear/clear-controller-horizon
+
+rpm -q openstack-dashboard &> /dev/null || yum install openstack-dashboard httpd mod_wsgi memcached python-memcached -y
+rpm -q python-pymongo &> /dev/null || yum install python-pymongo -y
+
+echo "Edit the dashboard config file"
+sed -i "s/ALLOWED_HOSTS = \['horizon.example.com', 'localhost'\]/ALLOWED_HOSTS = ['*']/" \
+         /etc/openstack-dashboard/local_settings
+sed -i 's/OPENSTACK_HOST = "127.0.0.1"/OPENSTACK_HOST = "'"$CONTROLLER_NODE_HOSTNAME"'"/' \
+         /etc/openstack-dashboard/local_settings
+
+#setsebool -P httpd_can_network_connect on
+chown -R apache:apache /usr/share/openstack-dashboard/static
+
+#stop httpd service
+systemctl stop httpd.service
+
+#IP access dashboard in browser
+sed  -i '/RedirectMatch  permanent/d' /etc/httpd/conf.d/openstack-dashboard.conf
+echo "RedirectMatch  permanent  ^/$ /dashboard" >> /etc/httpd/conf.d/openstack-dashboard.conf
+
+BEGIN_LINE=`awk '/^CACHES/{print NR}' /etc/openstack-dashboard/local_settings`
+let END_LINE=${BEGIN_LINE}+4
+#END_LINE=$BEGIN_LINE+4
+
+sed -i "$BEGIN_LINE,${END_LINE}d" /etc/openstack-dashboard/local_settings
+sed -i "${BEGIN_LINE}i\\
+CACHES= {\n\
+    'default': {\n\
+        'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',\n\
+        'LOCATION': '127.0.0.1:11211',\n\
+               }\n\
+        }\n\
+" /etc/openstack-dashboard/local_settings
+
+echo "config the dashboard style"
+/usr/local/bin/change-dashboard-style
+
+echo "start the http service"
+systemctl enable httpd.service memcached.service
+systemctl start httpd.service memcached.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:horizon:failed:start httpd service failed"; exit 1;fi
+
+systemctl status httpd.service
+systemctl status memcached.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:horizon:failed:start memcached service failed"; exit 1;fi
+
+systemctl stop httpd.service
+echo "python /usr/share/openstack-dashboard/manage.py syncdb"
+echo "no" | python /usr/share/openstack-dashboard/manage.py syncdb
+python /usr/share/openstack-dashboard/manage.py compress
+systemctl start httpd.service
+
+cp -rf /usr/local/bin/views.py /usr/lib/python2.7/site-packages/openstack_auth
+cp -rf /usr/local/bin/forms.py /usr/lib/python2.7/site-packages/openstack_auth
+cp -rf /usr/local/bin/backend.py /usr/lib/python2.7/site-packages/openstack_auth
+cp -rf /usr/local/bin/openstack_auth.pot /usr/lib/python2.7/site-packages/openstack_auth/locale/
+cp -rf /usr/local/bin/django.mo /usr/lib/python2.7/site-packages/openstack_auth/locale/zh_CN/LC_MESSAGES/
+
+echo "creat /etc/masssclouds/ dir"
+ConfPath="/etc/massclouds/"
+if [ ! -d $ConfPath ]; then
+mkdir $ConfPath
+chmod 777 $ConfPath
+fi
+
+MailConfPath="/etc/massclouds/mail_alarm.cfg"
+if [ ! -d $MailConfPath ]; then
+touch $MailConfPath
+chmod 777 $MailConfPath
+fi
+
+nova flavor-create m1.cserver_flavor 8 128 1 1
+nova flavor-create m1.vcenter_flavor 9 128 1 1
+
+systemctl enable HGPlatform
+systemctl restart HGPlatform
+systemctl status HGPlatform
+
+echo "finish the openstack configuration"
+send-service-report "$HostName:horizon:success"
+
+
+
+

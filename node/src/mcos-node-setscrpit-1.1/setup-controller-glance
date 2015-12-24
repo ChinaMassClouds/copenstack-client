@@ -1,0 +1,160 @@
+#!/bin/bash
+
+#get the configuration info
+source /etc/openstack.cfg
+
+HostName=`hostname`
+
+#NET_INTERFACE_NAME=`facter | grep interfaces | awk -F ' => ' '{print $2}' | awk -F , '{print $1}'`
+#THISHOST_IP=`facter | grep ipaddress_$NET_INTERFACE_NAME | awk '{print $3}'`
+THISHOST_IP=`facter | grep ipaddress_$MANAGE_NETWORKCARD_NAME | awk '{print $3}'`
+
+echo ""
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo "/////////////////      Hostname: $HostName    IP:$THISHOST_IP  ////////////////////"
+echo "/////////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "clear the glance service"
+/usr/local/bin/controller-node-clear/clear-controller-glance
+
+echo "yum install openstack-glance python-glanceclient"
+rpm -q openstack-glance &> /dev/null || yum install openstack-glance python-glanceclient -y
+
+#disable firewall and config selinux
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+sed -i 's/enforcing/permissive/g' /etc/selinux/config
+setenforce 0
+source /root/creds
+
+echo ""
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo "////////////////////////  configuration glance service   //////////////////////////////"
+echo "///////////////////////////////////////////////////////////////////////////////////////"
+echo ""
+
+echo "Create the glance database"
+if [ "$THISHOST_IP" == "$MARIADB_NODE_IP" ]; then
+    mysql -u root <<EOF
+CREATE DATABASE glance;
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '$GLANCE_DB_PASS';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY '$GLANCE_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+else
+    mysql -h $MARIADB_NODE_IP -u root -p$MARIADB_USER_PASS<<EOF
+CREATE DATABASE glance;
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '$GLANCE_DB_PASS';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY '$GLANCE_DB_PASS';
+FLUSH PRIVILEGES;
+EOF
+fi
+
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:create glance database failed"; exit 1;fi
+
+echo "Create keystone entries for glance"
+keystone user-list | grep glance &> /dev/null && keystone user-delete glance
+for ID in `keystone service-list | grep glance | awk '{print $2}'`;do keystone service-delete $ID; done
+
+keystone user-create --name glance --pass $GLANCE_USER_PASS
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:create glance user failed"; exit 1;fi
+
+keystone user-role-add --user glance --tenant service --role admin
+keystone service-create --name glance --type image \
+  --description "OpenStack Image Service"
+keystone endpoint-create \
+  --service-id $(keystone service-list | awk '/ image / {print $2}') \
+  --publicurl http://$CONTROLLER_NODE_HOSTNAME:9292 \
+  --internalurl http://$CONTROLLER_NODE_HOSTNAME:9292 \
+  --adminurl http://$CONTROLLER_NODE_HOSTNAME:9292 \
+  --region regionOne
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:create glance endpoint failed"; exit 1;fi
+
+sed -i "/^\[DEFAULT\]$/a \
+verbose = True\n\
+rpc_backend = rabbit\n\
+rabbit_host = $RABBITMQ_NODE_IP\n\
+rabbit_userid = $RABBITMQ_USER_NAME\n\
+rabbit_password = $RABBITMQ_USER_PASS\n\
+notification_driver = messaging" /etc/glance/glance-api.conf
+
+echo "Edit the glance config file"
+sed -i "/\[database\]/a \
+connection = mysql://glance:$GLANCE_DB_PASS@$MARIADB_NODE_IP/glance" /etc/glance/glance-api.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = glance\n\
+admin_password = $GLANCE_USER_PASS" /etc/glance/glance-api.conf
+
+sed -i "/\[paste_deploy\]/a \
+flavor = keystone" /etc/glance/glance-api.conf
+
+if [ "$GLANCE_STORE_TYPE" == "nfs" ]; then
+    rpm -q nfs-utils &> /dev/null || yum install nfs-utils portmap -y
+
+    GLANCE_LOCAL_FILE_STORE_DIR=/var/lib/glance/nfs/images
+    if [ ! -d "$GLANCE_LOCAL_FILE_STORE_DIR" ]; then
+        mkdir -pv $GLANCE_LOCAL_FILE_STORE_DIR
+        chown -R glance:glance $GLANCE_LOCAL_FILE_STORE_DIR
+    fi
+
+    sed -i '/\/var\/lib\/glance\/nfs\/images/d' /etc/fstab
+    echo "$NFS_NODE_HOSTNAME:/var/lib/glance/nfs/images /var/lib/glance/nfs/images nfs rw,soft 0 0" >> /etc/fstab
+    mount -t nfs $NFS_NODE_HOSTNAME:/var/lib/glance/nfs/images /var/lib/glance/nfs/images
+fi
+
+sed -i '/^default_store = file/d' /etc/glance/glance-api.conf
+sed -i '/^filesystem_store_datadir/d' /etc/glance/glance-api.conf
+
+sed -i "/\[glance_store\]/a \
+default_store = file\n\
+filesystem_store_datadir = $GLANCE_LOCAL_FILE_STORE_DIR" /etc/glance/glance-api.conf
+
+sed -i "/\[database\]/a \
+connection = mysql://glance:$GLANCE_DB_PASS@$MARIADB_NODE_IP/glance" /etc/glance/glance-registry.conf
+
+sed -i "/\[keystone_authtoken\]/a \
+auth_uri = http://$CONTROLLER_NODE_HOSTNAME:5000/v2.0\n\
+identity_uri = http://$CONTROLLER_NODE_HOSTNAME:35357\n\
+admin_tenant_name = service\n\
+admin_user = glance\n\
+admin_password = $GLANCE_USER_PASS" /etc/glance/glance-registry.conf
+
+sed -i "/\[paste_deploy\]/a \
+flavor = keystone" /etc/glance/glance-registry.conf
+
+echo "sync glance database"
+su -s /bin/sh -c "glance-manage db_sync" glance
+
+echo "start the glance service"
+systemctl enable openstack-glance-api.service openstack-glance-registry.service
+systemctl start openstack-glance-api.service openstack-glance-registry.service
+systemctl status openstack-glance-api.service 
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:start openstack-glance-api service failed"; exit 1;fi
+
+systemctl status openstack-glance-registry.service
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:start openstack-glance-registry service failed"; exit 1;fi
+
+echo "upload the cirros image to glance"
+glance image-create --name "cirros-0.3.3-x86_64" --file /var/lib/iso/cirros-0.3.3-x86_64-disk.img \
+  --disk-format qcow2 --container-format bare --is-public True --progress
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:upload image failed"; exit 1;fi
+
+glance image-create --name "cserver_template_image" --file /var/lib/iso/cirros-0.3.3-x86_64-disk.img \
+  --disk-format qcow2 --container-format bare --is-public True --progress
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:upload cserver image failed"; exit 1;fi
+
+glance image-create --name "cirros_vcenter_image" --is-public True --container-format bare --disk-format vmdk \
+  --property vmware_disktype="sparse" --property vmware_adaptertype="ide" < /var/lib/iso/cirros-0.3.3-x86_64-disk.vmdk
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:upload vcenter image failed"; exit 1;fi
+
+glance image-create --name "vcenter_template_image" --is-public True --container-format bare --disk-format vmdk \
+  --property vmware_disktype="sparse" --property vmware_adaptertype="ide" < /var/lib/iso/cirros-0.3.3-x86_64-disk.vmdk
+if [ $? -gt 0 ]; then send-service-report "$HostName:glance:failed:upload vcenter image failed"; exit 1;fi
+
+send-service-report "$HostName:glance:success"
+
